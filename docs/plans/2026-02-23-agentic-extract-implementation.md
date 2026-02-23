@@ -1,0 +1,3999 @@
+# Agentic Extract v1 Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** Build a 3-agent document extraction system (Coordinator, Specialist Pool, Validator) as a Claude Code skill that composes 12 open-source tools, dual-model Claude/Codex extraction, and confidence-based self-correction.
+
+**Architecture:** Approach B "Agentic Specialist Router" with deterministic routing, OCR-then-LLM pattern, 5-layer validation, and re-extraction loop with model switching. All open-source tools run in Docker containers.
+
+**Tech Stack:** Python 3.11+, Docker, Anthropic SDK, OpenAI SDK, asyncio, Pydantic, jsonschema, Pillow, pdf2image
+
+---
+
+## Phase 1: Foundation (Tasks 1-12)
+
+---
+
+### Task 1: Project Scaffolding
+
+**Files:**
+- Create: `pyproject.toml`
+- Create: `src/agentic_extract/__init__.py`
+- Create: `src/agentic_extract/py.typed`
+- Create: `tests/conftest.py`
+- Create: `.gitignore`
+- Test: `tests/test_scaffolding.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/test_scaffolding.py
+"""Verify project scaffolding is correct."""
+import importlib
+
+
+def test_package_importable():
+    """The agentic_extract package must be importable."""
+    mod = importlib.import_module("agentic_extract")
+    assert mod is not None
+
+
+def test_version_string_exists():
+    """The package must expose a __version__ string."""
+    from agentic_extract import __version__
+    assert isinstance(__version__, str)
+    assert len(__version__) > 0
+    # Semver-ish: at least "0.1.0"
+    parts = __version__.split(".")
+    assert len(parts) >= 3, f"Version {__version__} is not semver"
+
+
+def test_py_typed_marker_exists():
+    """py.typed marker must exist for PEP 561 compliance."""
+    import pathlib
+    import agentic_extract
+    pkg_dir = pathlib.Path(agentic_extract.__file__).parent
+    assert (pkg_dir / "py.typed").exists()
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_scaffolding.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract'"
+
+**Step 3: Write minimal implementation**
+
+```toml
+# pyproject.toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-extract"
+version = "0.1.0"
+description = "3-agent document extraction system with dual-model Claude/Codex extraction"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "pydantic>=2.0",
+    "pillow>=10.0",
+    "pdf2image>=1.16",
+    "pymupdf>=1.24",
+    "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentic_extract"]
+```
+
+```python
+# src/agentic_extract/__init__.py
+"""Agentic Extract: 3-agent document extraction system."""
+
+__version__ = "0.1.0"
+```
+
+```
+# src/agentic_extract/py.typed
+# PEP 561 marker file
+```
+
+```python
+# tests/conftest.py
+"""Shared test fixtures for agentic_extract."""
+import pathlib
+import tempfile
+
+import pytest
+
+
+@pytest.fixture
+def tmp_dir():
+    """Provide a temporary directory that is cleaned up after the test."""
+    with tempfile.TemporaryDirectory(prefix="ae_test_") as d:
+        yield pathlib.Path(d)
+
+
+@pytest.fixture
+def sample_image_path(tmp_dir: pathlib.Path) -> pathlib.Path:
+    """Create a minimal valid PNG file for testing."""
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), color="white")
+    path = tmp_dir / "sample.png"
+    img.save(path)
+    return path
+```
+
+```gitignore
+# .gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+secrets.env
+*.log
+.DS_Store
+# Docker volumes
+docker_data/
+/data/
+# Temp extraction dirs
+/tmp_extract_*/
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pip install -e ".[dev]" && pytest tests/test_scaffolding.py -v`
+Expected: PASS (3 passed)
+
+**Step 5: Commit**
+
+```bash
+git add pyproject.toml src/agentic_extract/__init__.py src/agentic_extract/py.typed tests/conftest.py tests/test_scaffolding.py .gitignore
+git commit -m "feat: project scaffolding with pyproject.toml, package init, and test infrastructure"
+```
+
+---
+
+### Task 2: Core Data Models
+
+**Files:**
+- Create: `src/agentic_extract/models.py`
+- Test: `tests/test_models.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/test_models.py
+"""Tests for core Pydantic data models."""
+import json
+from datetime import datetime, timezone
+
+import pytest
+from pydantic import ValidationError
+
+
+def test_bounding_box_valid():
+    from agentic_extract.models import BoundingBox
+    bb = BoundingBox(x=0.1, y=0.2, w=0.5, h=0.3)
+    assert bb.x == 0.1
+    assert bb.y == 0.2
+    assert bb.w == 0.5
+    assert bb.h == 0.3
+
+
+def test_bounding_box_rejects_out_of_range():
+    from agentic_extract.models import BoundingBox
+    with pytest.raises(ValidationError):
+        BoundingBox(x=-0.1, y=0.0, w=0.5, h=0.5)
+    with pytest.raises(ValidationError):
+        BoundingBox(x=0.0, y=0.0, w=1.5, h=0.5)
+
+
+def test_region_type_enum_values():
+    from agentic_extract.models import RegionType
+    assert RegionType.TEXT == "text"
+    assert RegionType.TABLE == "table"
+    assert RegionType.FIGURE == "figure"
+    assert RegionType.HANDWRITING == "handwriting"
+    assert RegionType.FORMULA == "formula"
+    assert RegionType.FORM_FIELD == "form_field"
+
+
+def test_text_content():
+    from agentic_extract.models import TextContent
+    tc = TextContent(text="Hello world", markdown="**Hello** world")
+    assert tc.text == "Hello world"
+    assert tc.markdown == "**Hello** world"
+
+
+def test_table_content():
+    from agentic_extract.models import TableContent, BoundingBox
+    cell_bbox = {"row": 0, "col": 0, "bbox": BoundingBox(x=0.1, y=0.2, w=0.3, h=0.05)}
+    tc = TableContent(
+        html="<table><tr><td>A</td></tr></table>",
+        json_data={"headers": ["Col1"], "rows": [{"Col1": "A"}]},
+        cell_bboxes=[cell_bbox],
+    )
+    assert tc.html.startswith("<table>")
+    assert tc.json_data["headers"] == ["Col1"]
+
+
+def test_figure_content():
+    from agentic_extract.models import FigureContent
+    fc = FigureContent(
+        description="A bar chart",
+        figure_type="bar_chart",
+        figure_json={"title": "Test Chart"},
+    )
+    assert fc.figure_type == "bar_chart"
+
+
+def test_handwriting_content():
+    from agentic_extract.models import HandwritingContent
+    hc = HandwritingContent(text="Patient notes", latex=None)
+    assert hc.text == "Patient notes"
+    assert hc.latex is None
+
+
+def test_formula_content():
+    from agentic_extract.models import FormulaContent
+    fc = FormulaContent(latex=r"\frac{a}{b}", mathml=None)
+    assert fc.latex == r"\frac{a}{b}"
+
+
+def test_region_with_text_content():
+    from agentic_extract.models import (
+        Region, RegionType, BoundingBox, TextContent,
+    )
+    region = Region(
+        id="region_001",
+        type=RegionType.TEXT,
+        subtype=None,
+        page=1,
+        bbox=BoundingBox(x=0.05, y=0.10, w=0.90, h=0.15),
+        content=TextContent(text="Hello", markdown="Hello"),
+        confidence=0.97,
+        extraction_method="paddleocr_3.0",
+        model_agreement=None,
+        needs_review=False,
+        review_reason=None,
+    )
+    assert region.id == "region_001"
+    assert region.type == RegionType.TEXT
+    assert region.confidence == 0.97
+    assert region.needs_review is False
+
+
+def test_region_rejects_confidence_out_of_range():
+    from agentic_extract.models import (
+        Region, RegionType, BoundingBox, TextContent,
+    )
+    with pytest.raises(ValidationError):
+        Region(
+            id="r1", type=RegionType.TEXT, subtype=None, page=1,
+            bbox=BoundingBox(x=0, y=0, w=1, h=1),
+            content=TextContent(text="x", markdown="x"),
+            confidence=1.5,
+            extraction_method="test",
+        )
+
+
+def test_document_metadata():
+    from agentic_extract.models import DocumentMetadata
+    dm = DocumentMetadata(
+        id="doc-123",
+        source="test.pdf",
+        page_count=10,
+        processing_timestamp=datetime.now(timezone.utc),
+        approach="B",
+        total_confidence=0.92,
+        processing_time_ms=18500,
+    )
+    assert dm.page_count == 10
+    assert dm.approach == "B"
+
+
+def test_processing_stage():
+    from agentic_extract.models import ProcessingStage
+    ps = ProcessingStage(stage="ingestion", duration_ms=1200)
+    assert ps.stage == "ingestion"
+
+
+def test_audit_trail():
+    from agentic_extract.models import AuditTrail, ProcessingStage
+    at = AuditTrail(
+        models_used=["claude_opus_4.6", "paddleocr_3.0"],
+        total_llm_calls=5,
+        re_extractions=1,
+        fields_flagged=0,
+        processing_stages=[
+            ProcessingStage(stage="ingestion", duration_ms=1200),
+            ProcessingStage(stage="ocr", duration_ms=3400),
+        ],
+    )
+    assert len(at.models_used) == 2
+    assert at.total_llm_calls == 5
+
+
+def test_extraction_result_full():
+    from agentic_extract.models import (
+        ExtractionResult, DocumentMetadata, Region, RegionType,
+        BoundingBox, TextContent, AuditTrail, ProcessingStage,
+    )
+    result = ExtractionResult(
+        document=DocumentMetadata(
+            id="doc-1", source="test.pdf", page_count=1,
+            processing_timestamp=datetime.now(timezone.utc),
+            approach="B", total_confidence=0.95, processing_time_ms=5000,
+        ),
+        markdown="# Test\n\nHello world",
+        regions=[
+            Region(
+                id="r1", type=RegionType.TEXT, subtype=None, page=1,
+                bbox=BoundingBox(x=0, y=0, w=1, h=0.5),
+                content=TextContent(text="Hello world", markdown="Hello world"),
+                confidence=0.95, extraction_method="paddleocr_3.0",
+            ),
+        ],
+        extracted_entities={"fields": {}},
+        audit_trail=AuditTrail(
+            models_used=["paddleocr_3.0"], total_llm_calls=0,
+            re_extractions=0, fields_flagged=0,
+            processing_stages=[ProcessingStage(stage="ingestion", duration_ms=100)],
+        ),
+    )
+    assert len(result.regions) == 1
+    # Must serialize to JSON without error
+    json_str = result.model_dump_json()
+    parsed = json.loads(json_str)
+    assert parsed["document"]["source"] == "test.pdf"
+
+
+def test_extraction_result_json_roundtrip():
+    from agentic_extract.models import (
+        ExtractionResult, DocumentMetadata, AuditTrail, ProcessingStage,
+    )
+    result = ExtractionResult(
+        document=DocumentMetadata(
+            id="doc-rt", source="roundtrip.pdf", page_count=0,
+            processing_timestamp=datetime.now(timezone.utc),
+            approach="B", total_confidence=1.0, processing_time_ms=0,
+        ),
+        markdown="",
+        regions=[],
+        extracted_entities={},
+        audit_trail=AuditTrail(
+            models_used=[], total_llm_calls=0, re_extractions=0,
+            fields_flagged=0, processing_stages=[],
+        ),
+    )
+    json_str = result.model_dump_json()
+    restored = ExtractionResult.model_validate_json(json_str)
+    assert restored.document.id == "doc-rt"
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_models.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.models'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/models.py
+"""Core Pydantic v2 data models for Agentic Extract.
+
+Matches the JSON output schema from design doc Section 6.
+All bounding box coordinates are normalized to [0, 1].
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class BoundingBox(BaseModel):
+    """Normalized bounding box with coordinates in [0, 1]."""
+
+    x: float = Field(..., ge=0.0, le=1.0, description="Left edge, normalized")
+    y: float = Field(..., ge=0.0, le=1.0, description="Top edge, normalized")
+    w: float = Field(..., ge=0.0, le=1.0, description="Width, normalized")
+    h: float = Field(..., ge=0.0, le=1.0, description="Height, normalized")
+
+
+class RegionType(str, Enum):
+    """Types of document regions detected by layout analysis."""
+
+    TEXT = "text"
+    TABLE = "table"
+    FIGURE = "figure"
+    HANDWRITING = "handwriting"
+    FORMULA = "formula"
+    FORM_FIELD = "form_field"
+
+
+# --- Region Content Types ---
+
+
+class TextContent(BaseModel):
+    """Content for text regions."""
+
+    text: str
+    markdown: str
+
+
+class TableContent(BaseModel):
+    """Content for table regions."""
+
+    html: str
+    json_data: dict[str, Any] = Field(default_factory=dict)
+    cell_bboxes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FigureContent(BaseModel):
+    """Content for figure/chart regions."""
+
+    description: str
+    figure_type: str | None = None
+    figure_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class HandwritingContent(BaseModel):
+    """Content for handwriting regions."""
+
+    text: str
+    latex: str | None = None
+
+
+class FormulaContent(BaseModel):
+    """Content for formula/equation regions."""
+
+    latex: str
+    mathml: str | None = None
+
+
+# Union type for region content
+RegionContent = TextContent | TableContent | FigureContent | HandwritingContent | FormulaContent
+
+
+class Region(BaseModel):
+    """A detected and extracted document region."""
+
+    id: str
+    type: RegionType
+    subtype: str | None = None
+    page: int = Field(..., ge=1)
+    bbox: BoundingBox
+    content: RegionContent
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    extraction_method: str
+    model_agreement: str | None = None
+    needs_review: bool = False
+    review_reason: str | None = None
+
+
+class DocumentMetadata(BaseModel):
+    """Metadata about the processed document."""
+
+    id: str
+    source: str
+    page_count: int = Field(..., ge=0)
+    processing_timestamp: datetime
+    approach: str
+    total_confidence: float = Field(..., ge=0.0, le=1.0)
+    processing_time_ms: int = Field(..., ge=0)
+
+
+class ProcessingStage(BaseModel):
+    """Timing information for a single processing stage."""
+
+    stage: str
+    duration_ms: int = Field(..., ge=0)
+
+
+class AuditTrail(BaseModel):
+    """Complete processing audit trail."""
+
+    models_used: list[str]
+    total_llm_calls: int = Field(..., ge=0)
+    re_extractions: int = Field(..., ge=0)
+    fields_flagged: int = Field(..., ge=0)
+    processing_stages: list[ProcessingStage]
+
+
+class ExtractionResult(BaseModel):
+    """Top-level extraction result containing all outputs."""
+
+    document: DocumentMetadata
+    markdown: str
+    regions: list[Region]
+    extracted_entities: dict[str, Any] = Field(default_factory=dict)
+    audit_trail: AuditTrail
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/test_models.py -v`
+Expected: PASS (14 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/models.py tests/test_models.py
+git commit -m "feat: core Pydantic v2 data models matching design doc Section 6 schema"
+```
+
+---
+
+### Task 3: Docker Tool Runner
+
+**Files:**
+- Create: `src/agentic_extract/tools/docker_runner.py`
+- Create: `src/agentic_extract/tools/__init__.py`
+- Test: `tests/tools/test_docker_runner.py`
+- Create: `tests/tools/__init__.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/tools/__init__.py
+```
+
+```python
+# tests/tools/test_docker_runner.py
+"""Tests for Docker tool runner."""
+import subprocess
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agentic_extract.tools.docker_runner import DockerTool, ToolOutput
+
+
+def test_tool_output_dataclass():
+    out = ToolOutput(stdout="hello", stderr="", exit_code=0, duration_ms=150)
+    assert out.stdout == "hello"
+    assert out.exit_code == 0
+    assert out.duration_ms == 150
+
+
+def test_docker_tool_init():
+    tool = DockerTool(image_name="paddleocr:latest", default_timeout=60)
+    assert tool.image_name == "paddleocr:latest"
+    assert tool.default_timeout == 60
+    assert tool.volumes == {}
+
+
+def test_docker_tool_init_with_volumes():
+    vols = {"/host/data": "/container/data"}
+    tool = DockerTool(image_name="test:latest", default_timeout=30, volumes=vols)
+    assert tool.volumes == {"/host/data": "/container/data"}
+
+
+def test_docker_tool_build_command():
+    tool = DockerTool(
+        image_name="myimage:latest",
+        default_timeout=30,
+        volumes={"/data": "/data"},
+    )
+    cmd = tool._build_command(["--input", "/data/test.png"])
+    assert cmd[0] == "docker"
+    assert "run" in cmd
+    assert "--rm" in cmd
+    assert "myimage:latest" in cmd
+    assert "-v" in cmd
+    assert "/data:/data" in cmd
+    assert "--input" in cmd
+    assert "/data/test.png" in cmd
+
+
+@patch("subprocess.run")
+def test_docker_tool_run_success(mock_run: MagicMock):
+    mock_run.return_value = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="output data", stderr="",
+    )
+    tool = DockerTool(image_name="test:latest", default_timeout=30)
+    result = tool.run(["--help"])
+    assert result.exit_code == 0
+    assert result.stdout == "output data"
+    assert result.stderr == ""
+    assert result.duration_ms >= 0
+    mock_run.assert_called_once()
+
+
+@patch("subprocess.run")
+def test_docker_tool_run_captures_stderr(mock_run: MagicMock):
+    mock_run.return_value = subprocess.CompletedProcess(
+        args=[], returncode=1, stdout="", stderr="Error: file not found",
+    )
+    tool = DockerTool(image_name="test:latest", default_timeout=30)
+    result = tool.run(["--bad-arg"])
+    assert result.exit_code == 1
+    assert "file not found" in result.stderr
+
+
+@patch("subprocess.run")
+def test_docker_tool_run_timeout(mock_run: MagicMock):
+    mock_run.side_effect = subprocess.TimeoutExpired(cmd="docker", timeout=5)
+    tool = DockerTool(image_name="test:latest", default_timeout=5)
+    result = tool.run(["--slow-op"])
+    assert result.exit_code == -1
+    assert "timeout" in result.stderr.lower()
+
+
+@patch("subprocess.run")
+def test_docker_tool_run_image_not_found(mock_run: MagicMock):
+    mock_run.return_value = subprocess.CompletedProcess(
+        args=[], returncode=125,
+        stdout="", stderr="Unable to find image 'fake:latest' locally",
+    )
+    tool = DockerTool(image_name="fake:latest", default_timeout=30)
+    result = tool.run([])
+    assert result.exit_code == 125
+    assert "Unable to find image" in result.stderr
+
+
+@patch("subprocess.run")
+def test_docker_tool_pull(mock_run: MagicMock):
+    mock_run.return_value = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="Status: Image is up to date", stderr="",
+    )
+    tool = DockerTool(image_name="test:latest", default_timeout=30)
+    success = tool.pull()
+    assert success is True
+    call_args = mock_run.call_args[0][0]
+    assert call_args == ["docker", "pull", "test:latest"]
+
+
+@patch("subprocess.run")
+def test_docker_tool_pull_failure(mock_run: MagicMock):
+    mock_run.return_value = subprocess.CompletedProcess(
+        args=[], returncode=1, stdout="", stderr="pull access denied",
+    )
+    tool = DockerTool(image_name="private:latest", default_timeout=30)
+    success = tool.pull()
+    assert success is False
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/tools/test_docker_runner.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.tools'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/tools/__init__.py
+"""Tool runners for open-source Docker containers."""
+```
+
+```python
+# src/agentic_extract/tools/docker_runner.py
+"""Base Docker tool runner for executing open-source tools in containers.
+
+Every open-source tool runs in its own Docker container. This module
+provides the base class for building tool-specific wrappers. Uses
+subprocess (not the Docker SDK) for simplicity and fewer dependencies.
+"""
+from __future__ import annotations
+
+import subprocess
+import time
+from dataclasses import dataclass
+
+
+@dataclass
+class ToolOutput:
+    """Result from running a Docker container."""
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration_ms: int
+
+
+class DockerTool:
+    """Base class for running open-source tools inside Docker containers.
+
+    Args:
+        image_name: Docker image name and tag (e.g. "paddleocr:latest").
+        default_timeout: Maximum seconds before killing the container.
+        volumes: Host-to-container volume mappings (e.g. {"/data": "/data"}).
+    """
+
+    def __init__(
+        self,
+        image_name: str,
+        default_timeout: int = 120,
+        volumes: dict[str, str] | None = None,
+    ) -> None:
+        self.image_name = image_name
+        self.default_timeout = default_timeout
+        self.volumes: dict[str, str] = volumes or {}
+
+    def _build_command(self, args: list[str]) -> list[str]:
+        """Build the full docker run command."""
+        cmd = ["docker", "run", "--rm"]
+        for host_path, container_path in self.volumes.items():
+            cmd.extend(["-v", f"{host_path}:{container_path}"])
+        cmd.append(self.image_name)
+        cmd.extend(args)
+        return cmd
+
+    def run(
+        self,
+        args: list[str],
+        timeout: int | None = None,
+    ) -> ToolOutput:
+        """Run the Docker container with the given arguments.
+
+        Args:
+            args: Command-line arguments to pass to the container entrypoint.
+            timeout: Override the default timeout (seconds).
+
+        Returns:
+            ToolOutput with stdout, stderr, exit code, and duration.
+        """
+        effective_timeout = timeout if timeout is not None else self.default_timeout
+        cmd = self._build_command(args)
+
+        start = time.monotonic()
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=effective_timeout,
+            )
+            duration_ms = int((time.monotonic() - start) * 1000)
+            return ToolOutput(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.returncode,
+                duration_ms=duration_ms,
+            )
+        except subprocess.TimeoutExpired:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            return ToolOutput(
+                stdout="",
+                stderr=f"Timeout after {effective_timeout}s",
+                exit_code=-1,
+                duration_ms=duration_ms,
+            )
+
+    def pull(self) -> bool:
+        """Pull the Docker image. Returns True on success."""
+        result = subprocess.run(
+            ["docker", "pull", self.image_name],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return result.returncode == 0
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/tools/test_docker_runner.py -v`
+Expected: PASS (10 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/tools/__init__.py src/agentic_extract/tools/docker_runner.py tests/tools/__init__.py tests/tools/test_docker_runner.py
+git commit -m "feat: Docker tool runner base class with subprocess execution and timeout handling"
+```
+
+---
+
+### Task 4: VLM Client Abstraction
+
+**Files:**
+- Create: `src/agentic_extract/clients/__init__.py`
+- Create: `src/agentic_extract/clients/vlm.py`
+- Test: `tests/clients/test_vlm.py`
+- Create: `tests/clients/__init__.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/clients/__init__.py
+```
+
+```python
+# tests/clients/test_vlm.py
+"""Tests for VLM client abstraction (Claude and Codex)."""
+import base64
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from agentic_extract.clients.vlm import (
+    ClaudeClient,
+    CodexClient,
+    VLMResponse,
+)
+
+
+def test_vlm_response_dataclass():
+    resp = VLMResponse(
+        content={"text": "hello"},
+        confidence=0.95,
+        model="claude-opus-4-20250514",
+        usage_tokens=150,
+        duration_ms=1200,
+    )
+    assert resp.content == {"text": "hello"}
+    assert resp.confidence == 0.95
+    assert resp.model == "claude-opus-4-20250514"
+
+
+def test_claude_client_init():
+    client = ClaudeClient(api_key="test-key", model="claude-opus-4-20250514")
+    assert client.model == "claude-opus-4-20250514"
+
+
+def test_codex_client_init():
+    client = CodexClient(api_key="test-key", model="gpt-4o")
+    assert client.model == "gpt-4o"
+
+
+@pytest.mark.asyncio
+async def test_claude_client_send_vision_request(tmp_path: Path):
+    # Create a tiny test image
+    from PIL import Image
+    img = Image.new("RGB", (10, 10), "red")
+    img_path = tmp_path / "test.png"
+    img.save(img_path)
+
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text='{"result": "extracted text"}')]
+    mock_message.usage.input_tokens = 100
+    mock_message.usage.output_tokens = 50
+
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+        MockAnthropic.return_value = mock_client
+
+        client = ClaudeClient(api_key="test-key", model="claude-opus-4-20250514")
+        client._client = mock_client
+
+        resp = await client.send_vision_request(
+            image_path=img_path,
+            prompt="Extract the text from this image.",
+        )
+        assert isinstance(resp, VLMResponse)
+        assert resp.content is not None
+        assert resp.usage_tokens == 150
+        assert resp.duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_codex_client_send_vision_request(tmp_path: Path):
+    from PIL import Image
+    img = Image.new("RGB", (10, 10), "blue")
+    img_path = tmp_path / "test.png"
+    img.save(img_path)
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = '{"result": "codex output"}'
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+    mock_response.usage.prompt_tokens = 80
+    mock_response.usage.completion_tokens = 40
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        MockOpenAI.return_value = mock_client
+
+        client = CodexClient(api_key="test-key", model="gpt-4o")
+        client._client = mock_client
+
+        resp = await client.send_vision_request(
+            image_path=img_path,
+            prompt="Extract the text from this image.",
+        )
+        assert isinstance(resp, VLMResponse)
+        assert resp.usage_tokens == 120
+        assert resp.duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_codex_client_structured_output(tmp_path: Path):
+    from PIL import Image
+    img = Image.new("RGB", (10, 10), "green")
+    img_path = tmp_path / "test.png"
+    img.save(img_path)
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = '{"headers": ["A"], "rows": [{"A": 1}]}'
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+    mock_response.usage.prompt_tokens = 100
+    mock_response.usage.completion_tokens = 50
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        MockOpenAI.return_value = mock_client
+
+        client = CodexClient(api_key="test-key", model="gpt-4o")
+        client._client = mock_client
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "headers": {"type": "array", "items": {"type": "string"}},
+                "rows": {"type": "array"},
+            },
+        }
+        resp = await client.send_vision_request(
+            image_path=img_path,
+            prompt="Extract the table.",
+            schema=schema,
+        )
+        assert resp.content is not None
+
+
+@pytest.mark.asyncio
+async def test_claude_client_handles_api_error(tmp_path: Path):
+    from PIL import Image
+    img = Image.new("RGB", (10, 10), "white")
+    img_path = tmp_path / "test.png"
+    img.save(img_path)
+
+    with patch("anthropic.Anthropic") as MockAnthropic:
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = Exception("API rate limit")
+        MockAnthropic.return_value = mock_client
+
+        client = ClaudeClient(
+            api_key="test-key", model="claude-opus-4-20250514", max_retries=1,
+        )
+        client._client = mock_client
+
+        with pytest.raises(RuntimeError, match="VLM request failed"):
+            await client.send_vision_request(
+                image_path=img_path,
+                prompt="Extract text.",
+            )
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/clients/test_vlm.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.clients'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/clients/__init__.py
+"""VLM client abstractions for Claude and Codex."""
+```
+
+```python
+# src/agentic_extract/clients/vlm.py
+"""VLM (Vision Language Model) client abstraction layer.
+
+Provides a unified interface for sending vision requests to Claude and
+Codex/GPT-4o. Handles image encoding, API calls, error handling, and
+exponential backoff for rate limits.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class VLMResponse:
+    """Response from a VLM vision request."""
+
+    content: Any
+    confidence: float
+    model: str
+    usage_tokens: int
+    duration_ms: int
+
+
+class VLMClient(ABC):
+    """Abstract base class for VLM clients."""
+
+    @abstractmethod
+    async def send_vision_request(
+        self,
+        image_path: Path,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+    ) -> VLMResponse:
+        """Send an image + prompt to the VLM and return structured response."""
+        ...
+
+
+def _encode_image_base64(image_path: Path) -> str:
+    """Read an image file and return its base64 encoding."""
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _detect_media_type(image_path: Path) -> str:
+    """Detect the media type from the file extension."""
+    suffix = image_path.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+    return media_types.get(suffix, "image/png")
+
+
+class ClaudeClient(VLMClient):
+    """Claude API client for vision requests.
+
+    Uses the Anthropic SDK to send images with prompts. Handles
+    exponential backoff on rate limits.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-opus-4-20250514",
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+    ) -> None:
+        import anthropic
+        self.model = model
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self._client = anthropic.Anthropic(api_key=api_key)
+
+    async def send_vision_request(
+        self,
+        image_path: Path,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+    ) -> VLMResponse:
+        image_b64 = _encode_image_base64(image_path)
+        media_type = _detect_media_type(image_path)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                start = time.monotonic()
+                response = self._client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    messages=messages,
+                )
+                duration_ms = int((time.monotonic() - start) * 1000)
+
+                raw_text = response.content[0].text
+                try:
+                    content = json.loads(raw_text)
+                except (json.JSONDecodeError, TypeError):
+                    content = {"raw_text": raw_text}
+
+                total_tokens = (
+                    response.usage.input_tokens + response.usage.output_tokens
+                )
+                return VLMResponse(
+                    content=content,
+                    confidence=0.9,
+                    model=self.model,
+                    usage_tokens=total_tokens,
+                    duration_ms=duration_ms,
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    delay = self.base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+
+        raise RuntimeError(
+            f"VLM request failed after {self.max_retries} attempts: {last_error}"
+        )
+
+
+class CodexClient(VLMClient):
+    """OpenAI/Codex API client for vision requests.
+
+    Uses the OpenAI SDK with optional Structured Outputs
+    (response_format) for schema enforcement.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4o",
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+    ) -> None:
+        import openai
+        self.model = model
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self._client = openai.OpenAI(api_key=api_key)
+
+    async def send_vision_request(
+        self,
+        image_path: Path,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+    ) -> VLMResponse:
+        image_b64 = _encode_image_base64(image_path)
+        media_type = _detect_media_type(image_path)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{image_b64}",
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 4096,
+        }
+        if schema is not None:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "extraction_output",
+                    "schema": schema,
+                },
+            }
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                start = time.monotonic()
+                response = self._client.chat.completions.create(**kwargs)
+                duration_ms = int((time.monotonic() - start) * 1000)
+
+                raw_text = response.choices[0].message.content
+                try:
+                    content = json.loads(raw_text)
+                except (json.JSONDecodeError, TypeError):
+                    content = {"raw_text": raw_text}
+
+                total_tokens = (
+                    response.usage.prompt_tokens
+                    + response.usage.completion_tokens
+                )
+                return VLMResponse(
+                    content=content,
+                    confidence=0.9,
+                    model=self.model,
+                    usage_tokens=total_tokens,
+                    duration_ms=duration_ms,
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    delay = self.base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+
+        raise RuntimeError(
+            f"VLM request failed after {self.max_retries} attempts: {last_error}"
+        )
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/clients/test_vlm.py -v`
+Expected: PASS (8 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/clients/__init__.py src/agentic_extract/clients/vlm.py tests/clients/__init__.py tests/clients/test_vlm.py
+git commit -m "feat: VLM client abstraction with Claude and Codex wrappers, exponential backoff"
+```
+
+---
+
+### Task 5: Coordinator - Ingestion
+
+**Files:**
+- Create: `src/agentic_extract/coordinator/__init__.py`
+- Create: `src/agentic_extract/coordinator/ingestion.py`
+- Test: `tests/coordinator/test_ingestion.py`
+- Create: `tests/coordinator/__init__.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/coordinator/__init__.py
+```
+
+```python
+# tests/coordinator/test_ingestion.py
+"""Tests for document ingestion (PDF and image handling)."""
+import pathlib
+from unittest.mock import MagicMock, patch
+
+import pytest
+from PIL import Image
+
+from agentic_extract.coordinator.ingestion import (
+    IngestionResult,
+    PageImage,
+    ingest,
+)
+
+
+def test_page_image_dataclass():
+    pi = PageImage(
+        page_number=1,
+        image_path=pathlib.Path("/tmp/page_1.png"),
+        width=2550,
+        height=3300,
+        dpi=300,
+    )
+    assert pi.page_number == 1
+    assert pi.dpi == 300
+
+
+def test_ingestion_result_dataclass():
+    result = IngestionResult(
+        pages=[],
+        temp_dir=pathlib.Path("/tmp/ae_test"),
+        source_file=pathlib.Path("test.png"),
+        page_count=0,
+    )
+    assert result.page_count == 0
+    assert result.pages == []
+
+
+def test_ingest_single_image(tmp_path: pathlib.Path):
+    """Ingesting a single image should produce one page."""
+    img = Image.new("RGB", (200, 300), "white")
+    img_path = tmp_path / "scan.png"
+    img.save(img_path, dpi=(150, 150))
+
+    result = ingest(img_path, output_dir=tmp_path / "output")
+
+    assert result.page_count == 1
+    assert len(result.pages) == 1
+    assert result.pages[0].page_number == 1
+    assert result.pages[0].width == 200
+    assert result.pages[0].height == 300
+    assert result.pages[0].image_path.exists()
+    assert result.source_file == img_path
+
+
+def test_ingest_single_image_jpeg(tmp_path: pathlib.Path):
+    """JPEG images should also work."""
+    img = Image.new("RGB", (100, 100), "blue")
+    img_path = tmp_path / "photo.jpg"
+    img.save(img_path)
+
+    result = ingest(img_path, output_dir=tmp_path / "output")
+    assert result.page_count == 1
+    assert result.pages[0].image_path.suffix == ".png"
+
+
+@patch("agentic_extract.coordinator.ingestion._convert_pdf_to_images")
+def test_ingest_pdf(mock_convert: MagicMock, tmp_path: pathlib.Path):
+    """PDFs should be converted to page images via pdf2image."""
+    # Create fake page images that the mock will "produce"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    for i in range(3):
+        img = Image.new("RGB", (612, 792), "white")
+        img.save(output_dir / f"page_{i + 1}.png", dpi=(72, 72))
+
+    mock_convert.return_value = [
+        output_dir / "page_1.png",
+        output_dir / "page_2.png",
+        output_dir / "page_3.png",
+    ]
+
+    pdf_path = tmp_path / "document.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake pdf content")
+
+    result = ingest(pdf_path, output_dir=output_dir)
+
+    assert result.page_count == 3
+    assert len(result.pages) == 3
+    assert result.pages[0].page_number == 1
+    assert result.pages[2].page_number == 3
+    mock_convert.assert_called_once()
+
+
+def test_ingest_unsupported_format(tmp_path: pathlib.Path):
+    """Unsupported file types should raise ValueError."""
+    bad_file = tmp_path / "data.csv"
+    bad_file.write_text("a,b,c\n1,2,3")
+
+    with pytest.raises(ValueError, match="Unsupported file type"):
+        ingest(bad_file, output_dir=tmp_path / "output")
+
+
+def test_ingest_missing_file(tmp_path: pathlib.Path):
+    """Missing files should raise FileNotFoundError."""
+    with pytest.raises(FileNotFoundError):
+        ingest(tmp_path / "nonexistent.pdf", output_dir=tmp_path / "output")
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/coordinator/test_ingestion.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.coordinator'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/coordinator/__init__.py
+"""Coordinator agent: ingestion, layout detection, routing, assembly."""
+```
+
+```python
+# src/agentic_extract/coordinator/ingestion.py
+"""Document ingestion: detect file type and convert to page images.
+
+Supports PDF (via pdf2image) and common image formats (PNG, JPEG, TIFF).
+All pages are normalized to PNG for downstream processing.
+"""
+from __future__ import annotations
+
+import pathlib
+import shutil
+from dataclasses import dataclass, field
+
+from PIL import Image
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
+PDF_EXTENSIONS = {".pdf"}
+SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
+
+
+@dataclass
+class PageImage:
+    """A single page converted to an image."""
+
+    page_number: int
+    image_path: pathlib.Path
+    width: int
+    height: int
+    dpi: int
+
+
+@dataclass
+class IngestionResult:
+    """Result of document ingestion."""
+
+    pages: list[PageImage]
+    temp_dir: pathlib.Path
+    source_file: pathlib.Path
+    page_count: int
+
+
+def _convert_pdf_to_images(
+    pdf_path: pathlib.Path,
+    output_dir: pathlib.Path,
+    dpi: int = 300,
+) -> list[pathlib.Path]:
+    """Convert a PDF to a list of page images using pdf2image.
+
+    Returns list of paths to the generated PNG files.
+    """
+    from pdf2image import convert_from_path
+
+    images = convert_from_path(str(pdf_path), dpi=dpi)
+    paths: list[pathlib.Path] = []
+    for i, img in enumerate(images):
+        out_path = output_dir / f"page_{i + 1}.png"
+        img.save(out_path, "PNG")
+        paths.append(out_path)
+    return paths
+
+
+def _get_dpi(img: Image.Image) -> int:
+    """Extract DPI from image metadata, defaulting to 72."""
+    info = img.info
+    dpi_val = info.get("dpi", (72, 72))
+    if isinstance(dpi_val, tuple):
+        return int(dpi_val[0])
+    return int(dpi_val)
+
+
+def ingest(
+    file_path: pathlib.Path,
+    output_dir: pathlib.Path | None = None,
+) -> IngestionResult:
+    """Ingest a document file and produce page images.
+
+    Args:
+        file_path: Path to the input file (PDF or image).
+        output_dir: Directory to write page images. Created if needed.
+
+    Returns:
+        IngestionResult with page images and metadata.
+
+    Raises:
+        FileNotFoundError: If file_path does not exist.
+        ValueError: If the file type is not supported.
+    """
+    file_path = pathlib.Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    suffix = file_path.suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type: {suffix}. "
+            f"Supported: {sorted(SUPPORTED_EXTENSIONS)}"
+        )
+
+    if output_dir is None:
+        output_dir = file_path.parent / f"ae_pages_{file_path.stem}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pages: list[PageImage] = []
+
+    if suffix in PDF_EXTENSIONS:
+        image_paths = _convert_pdf_to_images(file_path, output_dir)
+        for i, img_path in enumerate(image_paths):
+            img = Image.open(img_path)
+            dpi = _get_dpi(img)
+            pages.append(
+                PageImage(
+                    page_number=i + 1,
+                    image_path=img_path,
+                    width=img.width,
+                    height=img.height,
+                    dpi=dpi,
+                )
+            )
+    else:
+        # Single image file
+        img = Image.open(file_path)
+        dpi = _get_dpi(img)
+        out_path = output_dir / f"page_1.png"
+        img.save(out_path, "PNG")
+        pages.append(
+            PageImage(
+                page_number=1,
+                image_path=out_path,
+                width=img.width,
+                height=img.height,
+                dpi=dpi,
+            )
+        )
+
+    return IngestionResult(
+        pages=pages,
+        temp_dir=output_dir,
+        source_file=file_path,
+        page_count=len(pages),
+    )
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/coordinator/test_ingestion.py -v`
+Expected: PASS (6 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/coordinator/__init__.py src/agentic_extract/coordinator/ingestion.py tests/coordinator/__init__.py tests/coordinator/test_ingestion.py
+git commit -m "feat: document ingestion with PDF-to-image conversion and format detection"
+```
+
+---
+
+### Task 6: Coordinator - Layout Detection
+
+**Files:**
+- Create: `src/agentic_extract/coordinator/layout.py`
+- Test: `tests/coordinator/test_layout.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/coordinator/test_layout.py
+"""Tests for layout detection via DocLayout-YOLO."""
+import json
+import pathlib
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agentic_extract.coordinator.layout import (
+    DocLayoutYOLO,
+    LayoutRegion,
+    detect_layout,
+)
+from agentic_extract.models import BoundingBox, RegionType
+from agentic_extract.tools.docker_runner import ToolOutput
+
+
+def test_layout_region_dataclass():
+    lr = LayoutRegion(
+        region_id="r1",
+        region_type=RegionType.TEXT,
+        bbox=BoundingBox(x=0.1, y=0.2, w=0.8, h=0.1),
+        confidence=0.95,
+        page=1,
+    )
+    assert lr.region_id == "r1"
+    assert lr.region_type == RegionType.TEXT
+
+
+def test_yolo_class_id_mapping():
+    tool = DocLayoutYOLO()
+    assert tool._map_class_id(0) == RegionType.TEXT
+    assert tool._map_class_id(1) == RegionType.TABLE
+    assert tool._map_class_id(2) == RegionType.FIGURE
+    assert tool._map_class_id(3) == RegionType.FORMULA
+    assert tool._map_class_id(4) == RegionType.TEXT  # caption -> text
+    assert tool._map_class_id(999) == RegionType.TEXT  # unknown -> text
+
+
+@patch.object(DocLayoutYOLO, "_docker_tool")
+def test_detect_layout_parses_yolo_output(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    """DocLayout-YOLO JSON output should be parsed into LayoutRegion objects."""
+    from PIL import Image
+    img = Image.new("RGB", (1000, 1400), "white")
+    img_path = tmp_path / "page.png"
+    img.save(img_path)
+
+    yolo_output = json.dumps([
+        {
+            "class_id": 0,
+            "confidence": 0.96,
+            "bbox": [50, 100, 900, 250],
+        },
+        {
+            "class_id": 1,
+            "confidence": 0.91,
+            "bbox": [50, 300, 900, 700],
+        },
+        {
+            "class_id": 2,
+            "confidence": 0.88,
+            "bbox": [100, 750, 800, 1200],
+        },
+    ])
+
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout=yolo_output, stderr="", exit_code=0, duration_ms=500,
+    )
+
+    tool = DocLayoutYOLO()
+    regions = tool.detect(img_path, page_number=1)
+
+    assert len(regions) == 3
+    assert regions[0].region_type == RegionType.TEXT
+    assert regions[0].confidence == 0.96
+    assert regions[1].region_type == RegionType.TABLE
+    assert regions[2].region_type == RegionType.FIGURE
+
+    # Bounding boxes should be normalized to [0, 1]
+    assert 0.0 <= regions[0].bbox.x <= 1.0
+    assert 0.0 <= regions[0].bbox.w <= 1.0
+
+
+@patch.object(DocLayoutYOLO, "_docker_tool")
+def test_detect_layout_handles_empty_output(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), "white")
+    img_path = tmp_path / "blank.png"
+    img.save(img_path)
+
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout="[]", stderr="", exit_code=0, duration_ms=100,
+    )
+
+    tool = DocLayoutYOLO()
+    regions = tool.detect(img_path, page_number=1)
+    assert regions == []
+
+
+@patch.object(DocLayoutYOLO, "_docker_tool")
+def test_detect_layout_handles_docker_error(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), "white")
+    img_path = tmp_path / "error.png"
+    img.save(img_path)
+
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout="", stderr="Container crashed", exit_code=1, duration_ms=50,
+    )
+
+    tool = DocLayoutYOLO()
+    with pytest.raises(RuntimeError, match="Layout detection failed"):
+        tool.detect(img_path, page_number=1)
+
+
+def test_detect_layout_convenience_function(tmp_path: pathlib.Path):
+    from PIL import Image
+    img = Image.new("RGB", (500, 700), "white")
+    img_path = tmp_path / "page.png"
+    img.save(img_path)
+
+    mock_regions = [
+        LayoutRegion(
+            region_id="r1", region_type=RegionType.TEXT,
+            bbox=BoundingBox(x=0.1, y=0.1, w=0.8, h=0.2),
+            confidence=0.95, page=1,
+        ),
+    ]
+
+    with patch.object(DocLayoutYOLO, "detect", return_value=mock_regions):
+        regions = detect_layout(img_path, page_number=1)
+        assert len(regions) == 1
+        assert regions[0].region_id == "r1"
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/coordinator/test_layout.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.coordinator.layout'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/coordinator/layout.py
+"""Layout detection using DocLayout-YOLO in Docker.
+
+Runs DocLayout-YOLO on page images to detect regions (text blocks,
+tables, figures, formulas) and returns normalized bounding boxes
+with region type classifications.
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import uuid
+from dataclasses import dataclass
+
+from PIL import Image
+
+from agentic_extract.models import BoundingBox, RegionType
+from agentic_extract.tools.docker_runner import DockerTool
+
+
+# DocLayout-YOLO class ID to RegionType mapping
+YOLO_CLASS_MAP: dict[int, RegionType] = {
+    0: RegionType.TEXT,          # text block
+    1: RegionType.TABLE,         # table
+    2: RegionType.FIGURE,        # figure
+    3: RegionType.FORMULA,       # formula / equation
+    4: RegionType.TEXT,          # caption (treat as text)
+    5: RegionType.TEXT,          # list (treat as text)
+    6: RegionType.TEXT,          # title / heading
+    7: RegionType.TEXT,          # header
+    8: RegionType.TEXT,          # footer
+    9: RegionType.FORM_FIELD,   # form element
+}
+
+
+@dataclass
+class LayoutRegion:
+    """A region detected by layout analysis."""
+
+    region_id: str
+    region_type: RegionType
+    bbox: BoundingBox
+    confidence: float
+    page: int
+
+
+class DocLayoutYOLO:
+    """DocLayout-YOLO wrapper for document layout detection.
+
+    Runs the YOLO model inside a Docker container and parses
+    the JSON output into LayoutRegion objects.
+    """
+
+    IMAGE_NAME = "doclayout-yolo:latest"
+
+    def __init__(
+        self,
+        image_name: str | None = None,
+        volumes: dict[str, str] | None = None,
+    ) -> None:
+        self._image_name = image_name or self.IMAGE_NAME
+        self._volumes = volumes or {}
+
+    @staticmethod
+    def _docker_tool(
+        image_name: str, volumes: dict[str, str],
+    ) -> DockerTool:
+        return DockerTool(
+            image_name=image_name,
+            default_timeout=120,
+            volumes=volumes,
+        )
+
+    def _map_class_id(self, class_id: int) -> RegionType:
+        """Map a YOLO class ID to a RegionType."""
+        return YOLO_CLASS_MAP.get(class_id, RegionType.TEXT)
+
+    def detect(
+        self,
+        image_path: pathlib.Path,
+        page_number: int,
+    ) -> list[LayoutRegion]:
+        """Run layout detection on a page image.
+
+        Args:
+            image_path: Path to the page image.
+            page_number: 1-based page number.
+
+        Returns:
+            List of detected LayoutRegion objects.
+
+        Raises:
+            RuntimeError: If the Docker container fails.
+        """
+        img = Image.open(image_path)
+        img_w, img_h = img.size
+
+        tool = self._docker_tool(self._image_name, self._volumes)
+        result = tool.run(["--input", str(image_path), "--format", "json"])
+
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Layout detection failed (exit {result.exit_code}): "
+                f"{result.stderr}"
+            )
+
+        if not result.stdout.strip():
+            return []
+
+        raw_detections = json.loads(result.stdout)
+        regions: list[LayoutRegion] = []
+
+        for det in raw_detections:
+            class_id = det["class_id"]
+            conf = det["confidence"]
+            x1, y1, x2, y2 = det["bbox"]
+
+            # Normalize coordinates to [0, 1]
+            nx = x1 / img_w
+            ny = y1 / img_h
+            nw = (x2 - x1) / img_w
+            nh = (y2 - y1) / img_h
+
+            # Clamp to valid range
+            nx = max(0.0, min(1.0, nx))
+            ny = max(0.0, min(1.0, ny))
+            nw = max(0.0, min(1.0 - nx, nw))
+            nh = max(0.0, min(1.0 - ny, nh))
+
+            region_id = f"r_{page_number}_{uuid.uuid4().hex[:8]}"
+            regions.append(
+                LayoutRegion(
+                    region_id=region_id,
+                    region_type=self._map_class_id(class_id),
+                    bbox=BoundingBox(x=nx, y=ny, w=nw, h=nh),
+                    confidence=conf,
+                    page=page_number,
+                )
+            )
+
+        return regions
+
+
+def detect_layout(
+    image_path: pathlib.Path,
+    page_number: int,
+) -> list[LayoutRegion]:
+    """Convenience function to detect layout on a single page."""
+    detector = DocLayoutYOLO()
+    return detector.detect(image_path, page_number)
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/coordinator/test_layout.py -v`
+Expected: PASS (6 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/coordinator/layout.py tests/coordinator/test_layout.py
+git commit -m "feat: layout detection with DocLayout-YOLO Docker wrapper and bbox normalization"
+```
+
+---
+
+### Task 7: Coordinator - Reading Order
+
+**Files:**
+- Create: `src/agentic_extract/coordinator/reading_order.py`
+- Test: `tests/coordinator/test_reading_order.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/coordinator/test_reading_order.py
+"""Tests for reading order determination via Surya."""
+import json
+import pathlib
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agentic_extract.coordinator.layout import LayoutRegion
+from agentic_extract.coordinator.reading_order import (
+    SuryaReadingOrder,
+    determine_reading_order,
+    fallback_reading_order,
+)
+from agentic_extract.models import BoundingBox, RegionType
+from agentic_extract.tools.docker_runner import ToolOutput
+
+
+def _make_region(
+    rid: str, x: float, y: float, w: float = 0.8, h: float = 0.1, page: int = 1,
+) -> LayoutRegion:
+    return LayoutRegion(
+        region_id=rid,
+        region_type=RegionType.TEXT,
+        bbox=BoundingBox(x=x, y=y, w=w, h=h),
+        confidence=0.95,
+        page=page,
+    )
+
+
+def test_fallback_reading_order_sorts_top_to_bottom():
+    """Without Surya, regions should sort by page then y-coordinate."""
+    regions = [
+        _make_region("r3", x=0.1, y=0.7, page=1),
+        _make_region("r1", x=0.1, y=0.1, page=1),
+        _make_region("r2", x=0.1, y=0.4, page=1),
+    ]
+    order = fallback_reading_order(regions)
+    assert order == ["r1", "r2", "r3"]
+
+
+def test_fallback_reading_order_multipage():
+    """Multi-page regions: page 1 regions come before page 2."""
+    regions = [
+        _make_region("r2_p2", x=0.1, y=0.1, page=2),
+        _make_region("r1_p1", x=0.1, y=0.5, page=1),
+        _make_region("r0_p1", x=0.1, y=0.1, page=1),
+    ]
+    order = fallback_reading_order(regions)
+    assert order == ["r0_p1", "r1_p1", "r2_p2"]
+
+
+def test_fallback_reading_order_two_column():
+    """Two-column layout: left column before right column at same y."""
+    regions = [
+        _make_region("right", x=0.55, y=0.1, w=0.4),
+        _make_region("left", x=0.05, y=0.1, w=0.4),
+    ]
+    order = fallback_reading_order(regions)
+    assert order == ["left", "right"]
+
+
+@patch.object(SuryaReadingOrder, "_docker_tool")
+def test_surya_reading_order(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), "white")
+    img_path = tmp_path / "page.png"
+    img.save(img_path)
+
+    surya_output = json.dumps({"reading_order": ["r2", "r1", "r3"]})
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout=surya_output, stderr="", exit_code=0, duration_ms=300,
+    )
+
+    tool = SuryaReadingOrder()
+    order = tool.get_reading_order(
+        img_path,
+        region_ids=["r1", "r2", "r3"],
+    )
+    assert order == ["r2", "r1", "r3"]
+
+
+@patch.object(SuryaReadingOrder, "_docker_tool")
+def test_surya_fallback_on_failure(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    """If Surya fails, determine_reading_order should fall back gracefully."""
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), "white")
+    img_path = tmp_path / "page.png"
+    img.save(img_path)
+
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout="", stderr="Surya crashed", exit_code=1, duration_ms=50,
+    )
+
+    regions = [
+        _make_region("r1", x=0.1, y=0.1),
+        _make_region("r2", x=0.1, y=0.5),
+    ]
+    order = determine_reading_order(img_path, regions)
+    # Should fall back to geometric ordering
+    assert order == ["r1", "r2"]
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/coordinator/test_reading_order.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.coordinator.reading_order'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/coordinator/reading_order.py
+"""Reading order determination using Surya with geometric fallback.
+
+Surya provides ML-based reading order detection. When unavailable,
+a geometric heuristic (top-to-bottom, left-to-right with column
+detection) is used as fallback.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+
+from agentic_extract.coordinator.layout import LayoutRegion
+from agentic_extract.tools.docker_runner import DockerTool
+
+logger = logging.getLogger(__name__)
+
+
+def fallback_reading_order(regions: list[LayoutRegion]) -> list[str]:
+    """Geometric reading order: sort by page, then y, then x.
+
+    This handles single-column and basic two-column layouts.
+    Regions at similar y-positions (within 2% of page height)
+    are sorted left-to-right.
+    """
+    Y_TOLERANCE = 0.02
+
+    def sort_key(r: LayoutRegion) -> tuple[int, float, float]:
+        # Round y to nearest tolerance band to group same-row items
+        y_band = round(r.bbox.y / Y_TOLERANCE) * Y_TOLERANCE
+        return (r.page, y_band, r.bbox.x)
+
+    sorted_regions = sorted(regions, key=sort_key)
+    return [r.region_id for r in sorted_regions]
+
+
+class SuryaReadingOrder:
+    """Surya reading order detection via Docker.
+
+    Runs the Surya model to determine the correct reading
+    order of detected regions on a page.
+    """
+
+    IMAGE_NAME = "surya-ocr:latest"
+
+    def __init__(
+        self,
+        image_name: str | None = None,
+        volumes: dict[str, str] | None = None,
+    ) -> None:
+        self._image_name = image_name or self.IMAGE_NAME
+        self._volumes = volumes or {}
+
+    @staticmethod
+    def _docker_tool(
+        image_name: str, volumes: dict[str, str],
+    ) -> DockerTool:
+        return DockerTool(
+            image_name=image_name,
+            default_timeout=120,
+            volumes=volumes,
+        )
+
+    def get_reading_order(
+        self,
+        image_path: pathlib.Path,
+        region_ids: list[str],
+    ) -> list[str]:
+        """Run Surya to determine reading order.
+
+        Args:
+            image_path: Path to the page image.
+            region_ids: List of region IDs to order.
+
+        Returns:
+            Ordered list of region IDs.
+
+        Raises:
+            RuntimeError: If Surya fails.
+        """
+        tool = self._docker_tool(self._image_name, self._volumes)
+        result = tool.run(["--input", str(image_path), "--format", "json"])
+
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Surya reading order failed (exit {result.exit_code}): "
+                f"{result.stderr}"
+            )
+
+        data = json.loads(result.stdout)
+        return data.get("reading_order", region_ids)
+
+
+def determine_reading_order(
+    image_path: pathlib.Path,
+    regions: list[LayoutRegion],
+) -> list[str]:
+    """Determine reading order, falling back to geometric sort on failure.
+
+    Tries Surya first. If it fails (Docker not available, model error),
+    falls back to the geometric heuristic.
+    """
+    region_ids = [r.region_id for r in regions]
+    try:
+        surya = SuryaReadingOrder()
+        return surya.get_reading_order(image_path, region_ids)
+    except Exception as exc:
+        logger.warning("Surya reading order failed, using fallback: %s", exc)
+        return fallback_reading_order(regions)
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/coordinator/test_reading_order.py -v`
+Expected: PASS (6 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/coordinator/reading_order.py tests/coordinator/test_reading_order.py
+git commit -m "feat: reading order with Surya Docker wrapper and geometric fallback heuristic"
+```
+
+---
+
+### Task 8: Coordinator - Quality Assessment
+
+**Files:**
+- Create: `src/agentic_extract/coordinator/quality.py`
+- Test: `tests/coordinator/test_quality.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/coordinator/test_quality.py
+"""Tests for document quality assessment."""
+import pathlib
+
+import pytest
+from PIL import Image, ImageDraw
+
+from agentic_extract.coordinator.ingestion import PageImage
+from agentic_extract.coordinator.quality import (
+    QualityAssessment,
+    assess_quality,
+)
+
+
+def _make_page_image(
+    tmp_path: pathlib.Path,
+    width: int = 2550,
+    height: int = 3300,
+    dpi: int = 300,
+    color: str = "white",
+    name: str = "page.png",
+) -> PageImage:
+    """Helper to create a PageImage with an actual image file."""
+    img = Image.new("RGB", (width, height), color)
+    path = tmp_path / name
+    img.save(path, dpi=(dpi, dpi))
+    return PageImage(
+        page_number=1, image_path=path, width=width, height=height, dpi=dpi,
+    )
+
+
+def test_quality_assessment_dataclass():
+    qa = QualityAssessment(
+        dpi=300,
+        skew_angle=0.5,
+        degradation_score=0.2,
+        needs_enhancement=False,
+    )
+    assert qa.dpi == 300
+    assert qa.needs_enhancement is False
+
+
+def test_quality_high_quality_scan(tmp_path: pathlib.Path):
+    """A clean, high-DPI white image should score well."""
+    page = _make_page_image(tmp_path, dpi=300)
+    qa = assess_quality(page)
+    assert qa.dpi == 300
+    assert qa.degradation_score < 0.5
+    assert qa.needs_enhancement is False
+
+
+def test_quality_low_dpi_flagged(tmp_path: pathlib.Path):
+    """Low DPI should increase degradation score."""
+    page = _make_page_image(tmp_path, width=612, height=792, dpi=72)
+    qa = assess_quality(page)
+    assert qa.dpi == 72
+    # Low DPI contributes to degradation
+    assert qa.degradation_score > 0.0
+
+
+def test_quality_noisy_image(tmp_path: pathlib.Path):
+    """A noisy/dark image should have higher degradation."""
+    import random
+    random.seed(42)
+    img = Image.new("RGB", (500, 500), "white")
+    pixels = img.load()
+    # Add noise: random dark pixels
+    for x in range(500):
+        for y in range(500):
+            if random.random() < 0.3:
+                pixels[x, y] = (50, 50, 50)
+    path = tmp_path / "noisy.png"
+    img.save(path, dpi=(150, 150))
+    page = PageImage(page_number=1, image_path=path, width=500, height=500, dpi=150)
+
+    qa = assess_quality(page)
+    assert qa.degradation_score > 0.2
+
+
+def test_quality_needs_enhancement_threshold(tmp_path: pathlib.Path):
+    """needs_enhancement should be True when degradation_score > 0.5."""
+    # Create a very degraded image: mostly dark
+    img = Image.new("RGB", (200, 200), (40, 40, 40))
+    path = tmp_path / "dark.png"
+    img.save(path, dpi=(72, 72))
+    page = PageImage(page_number=1, image_path=path, width=200, height=200, dpi=72)
+
+    qa = assess_quality(page)
+    assert qa.degradation_score > 0.5
+    assert qa.needs_enhancement is True
+
+
+def test_quality_skew_angle_is_float(tmp_path: pathlib.Path):
+    """Skew angle should always be a float."""
+    page = _make_page_image(tmp_path)
+    qa = assess_quality(page)
+    assert isinstance(qa.skew_angle, float)
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/coordinator/test_quality.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.coordinator.quality'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/coordinator/quality.py
+"""Document quality assessment: DPI, skew, degradation scoring.
+
+Provides a quick assessment of page image quality to determine
+whether enhancement (via DocEnTr) is needed before extraction.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+from agentic_extract.coordinator.ingestion import PageImage
+
+# Degradation threshold: above this, DocEnTr enhancement is triggered
+ENHANCEMENT_THRESHOLD = 0.5
+
+# DPI below this is considered low quality
+LOW_DPI_THRESHOLD = 150
+
+# Ideal DPI for document scanning
+IDEAL_DPI = 300
+
+
+@dataclass
+class QualityAssessment:
+    """Quality assessment results for a page image."""
+
+    dpi: int
+    skew_angle: float
+    degradation_score: float
+    needs_enhancement: bool
+
+
+def _estimate_contrast_ratio(img_array: np.ndarray) -> float:
+    """Estimate contrast ratio from grayscale image array.
+
+    Returns a value in [0, 1] where 1 is maximum contrast.
+    Low contrast (washed out or very dark) yields low scores.
+    """
+    if img_array.size == 0:
+        return 0.0
+    min_val = float(np.min(img_array))
+    max_val = float(np.max(img_array))
+    if max_val == 0:
+        return 0.0
+    return (max_val - min_val) / 255.0
+
+
+def _estimate_noise_level(img_array: np.ndarray) -> float:
+    """Estimate noise level from grayscale image array.
+
+    Uses standard deviation of local pixel differences as a
+    proxy for noise. Returns value in [0, 1].
+    """
+    if img_array.size < 4:
+        return 0.0
+    # Compute horizontal differences
+    h_diff = np.abs(np.diff(img_array.astype(np.float32), axis=1))
+    noise = float(np.mean(h_diff)) / 255.0
+    return min(1.0, noise)
+
+
+def _estimate_skew(img_array: np.ndarray) -> float:
+    """Estimate skew angle using a simple edge-based heuristic.
+
+    This is a lightweight approximation. For production quality,
+    Surya or a dedicated deskew tool would be used.
+    Returns angle in degrees.
+    """
+    # Simple heuristic: variance of row-wise mean brightness
+    # Skewed documents show gradual brightness transitions
+    # This returns a small angle estimate (good enough for assessment)
+    if img_array.shape[0] < 10:
+        return 0.0
+
+    row_means = np.mean(img_array, axis=1)
+    # Compute gradient of row means
+    gradient = np.diff(row_means.astype(np.float64))
+    if len(gradient) == 0:
+        return 0.0
+
+    # Estimate skew from gradient variance (heuristic)
+    grad_std = float(np.std(gradient))
+    # Map to approximate degrees (rough heuristic)
+    angle = min(15.0, grad_std * 0.1)
+    return round(angle, 2)
+
+
+def assess_quality(page: PageImage) -> QualityAssessment:
+    """Assess the quality of a page image.
+
+    Evaluates DPI, skew angle, and degradation (contrast + noise).
+    Sets needs_enhancement=True if degradation_score exceeds threshold.
+
+    Args:
+        page: PageImage with path to the image file.
+
+    Returns:
+        QualityAssessment with all metrics.
+    """
+    img = Image.open(page.image_path).convert("L")  # grayscale
+    img_array = np.array(img)
+
+    # DPI score: penalty for low DPI
+    dpi_score = min(1.0, page.dpi / IDEAL_DPI)
+    dpi_penalty = max(0.0, 1.0 - dpi_score)
+
+    # Contrast: low contrast = degraded
+    contrast = _estimate_contrast_ratio(img_array)
+    contrast_penalty = max(0.0, 1.0 - contrast)
+
+    # Noise estimation
+    noise = _estimate_noise_level(img_array)
+
+    # Skew estimation
+    skew = _estimate_skew(img_array)
+    skew_penalty = min(1.0, abs(skew) / 15.0)
+
+    # Composite degradation score (weighted average)
+    degradation_score = (
+        dpi_penalty * 0.3
+        + contrast_penalty * 0.35
+        + noise * 0.25
+        + skew_penalty * 0.1
+    )
+    degradation_score = min(1.0, max(0.0, degradation_score))
+
+    return QualityAssessment(
+        dpi=page.dpi,
+        skew_angle=skew,
+        degradation_score=round(degradation_score, 4),
+        needs_enhancement=degradation_score > ENHANCEMENT_THRESHOLD,
+    )
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/coordinator/test_quality.py -v`
+Expected: PASS (6 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/coordinator/quality.py tests/coordinator/test_quality.py
+git commit -m "feat: page quality assessment with DPI, contrast, noise, and skew scoring"
+```
+
+---
+
+### Task 9: Coordinator - Routing
+
+**Files:**
+- Create: `src/agentic_extract/coordinator/routing.py`
+- Test: `tests/coordinator/test_routing.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/coordinator/test_routing.py
+"""Tests for deterministic region-to-specialist routing."""
+import pathlib
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from agentic_extract.coordinator.layout import LayoutRegion
+from agentic_extract.coordinator.quality import QualityAssessment
+from agentic_extract.coordinator.routing import (
+    RoutingEntry,
+    RoutingPlan,
+    SpecialistType,
+    generate_routing_plan,
+)
+from agentic_extract.models import BoundingBox, RegionType
+
+
+def _make_region(
+    rid: str, rtype: RegionType, conf: float = 0.95, page: int = 1,
+) -> LayoutRegion:
+    return LayoutRegion(
+        region_id=rid, region_type=rtype,
+        bbox=BoundingBox(x=0.1, y=0.1, w=0.8, h=0.2),
+        confidence=conf, page=page,
+    )
+
+
+def test_specialist_type_enum():
+    assert SpecialistType.TEXT == "text_specialist"
+    assert SpecialistType.TABLE == "table_specialist"
+    assert SpecialistType.VISUAL == "visual_specialist"
+
+
+def test_routing_entry_dataclass():
+    entry = RoutingEntry(
+        region_id="r1",
+        specialist=SpecialistType.TEXT,
+        model_assignment="claude",
+        priority=1,
+    )
+    assert entry.specialist == SpecialistType.TEXT
+
+
+def test_routing_plan_dataclass():
+    plan = RoutingPlan(entries=[])
+    assert plan.entries == []
+
+
+def test_text_region_routes_to_text_specialist():
+    regions = [_make_region("r1", RegionType.TEXT)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert len(plan.entries) == 1
+    assert plan.entries[0].specialist == SpecialistType.TEXT
+    assert plan.entries[0].region_id == "r1"
+
+
+def test_table_region_routes_to_table_specialist():
+    regions = [_make_region("r1", RegionType.TABLE)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert plan.entries[0].specialist == SpecialistType.TABLE
+
+
+def test_figure_routes_to_visual():
+    regions = [_make_region("r1", RegionType.FIGURE)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert plan.entries[0].specialist == SpecialistType.VISUAL
+
+
+def test_handwriting_routes_to_visual():
+    regions = [_make_region("r1", RegionType.HANDWRITING)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert plan.entries[0].specialist == SpecialistType.VISUAL
+
+
+def test_formula_routes_to_visual():
+    regions = [_make_region("r1", RegionType.FORMULA)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert plan.entries[0].specialist == SpecialistType.VISUAL
+
+
+def test_form_field_routes_to_text():
+    regions = [_make_region("r1", RegionType.FORM_FIELD)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert plan.entries[0].specialist == SpecialistType.TEXT
+
+
+def test_mixed_regions_route_correctly():
+    regions = [
+        _make_region("r_text", RegionType.TEXT),
+        _make_region("r_table", RegionType.TABLE),
+        _make_region("r_fig", RegionType.FIGURE),
+        _make_region("r_hw", RegionType.HANDWRITING),
+    ]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert len(plan.entries) == 4
+
+    routing_map = {e.region_id: e.specialist for e in plan.entries}
+    assert routing_map["r_text"] == SpecialistType.TEXT
+    assert routing_map["r_table"] == SpecialistType.TABLE
+    assert routing_map["r_fig"] == SpecialistType.VISUAL
+    assert routing_map["r_hw"] == SpecialistType.VISUAL
+
+
+def test_low_confidence_region_still_routes():
+    """Low-confidence regions (< 0.5) should still get a routing entry.
+
+    In the full system, these would trigger a Claude classification
+    call, but routing should never drop a region.
+    """
+    regions = [_make_region("r_ambiguous", RegionType.TEXT, conf=0.3)]
+    quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    plan = generate_routing_plan(regions, quality)
+    assert len(plan.entries) == 1
+    assert plan.entries[0].region_id == "r_ambiguous"
+
+
+def test_degraded_quality_sets_higher_priority():
+    """Degraded documents should get higher priority (lower number)."""
+    regions = [_make_region("r1", RegionType.TEXT)]
+    good_quality = QualityAssessment(dpi=300, skew_angle=0.0, degradation_score=0.1, needs_enhancement=False)
+    bad_quality = QualityAssessment(dpi=72, skew_angle=5.0, degradation_score=0.7, needs_enhancement=True)
+
+    plan_good = generate_routing_plan(regions, good_quality)
+    plan_bad = generate_routing_plan(regions, bad_quality)
+
+    # Higher priority (lower number) for degraded docs
+    assert plan_bad.entries[0].priority <= plan_good.entries[0].priority
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/coordinator/test_routing.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.coordinator.routing'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/coordinator/routing.py
+"""Deterministic routing of regions to extraction specialists.
+
+Uses rule-based logic to assign each region to the appropriate
+specialist (Text, Table, or Visual). For ambiguous regions with
+confidence < 0.5, a Claude classification call would be made
+in the full system; here we route based on the detected type.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+from agentic_extract.coordinator.layout import LayoutRegion
+from agentic_extract.coordinator.quality import QualityAssessment
+from agentic_extract.models import RegionType
+
+
+class SpecialistType(str, Enum):
+    """Available extraction specialists."""
+
+    TEXT = "text_specialist"
+    TABLE = "table_specialist"
+    VISUAL = "visual_specialist"
+
+
+# Deterministic routing rules: RegionType -> SpecialistType
+ROUTING_RULES: dict[RegionType, SpecialistType] = {
+    RegionType.TEXT: SpecialistType.TEXT,
+    RegionType.TABLE: SpecialistType.TABLE,
+    RegionType.FIGURE: SpecialistType.VISUAL,
+    RegionType.HANDWRITING: SpecialistType.VISUAL,
+    RegionType.FORMULA: SpecialistType.VISUAL,
+    RegionType.FORM_FIELD: SpecialistType.TEXT,
+}
+
+# Default model assignments per specialist
+MODEL_ASSIGNMENTS: dict[SpecialistType, str] = {
+    SpecialistType.TEXT: "claude",
+    SpecialistType.TABLE: "claude+codex",
+    SpecialistType.VISUAL: "codex+claude",
+}
+
+# Confidence threshold below which a region is considered ambiguous
+AMBIGUITY_THRESHOLD = 0.5
+
+
+@dataclass
+class RoutingEntry:
+    """Routing decision for a single region."""
+
+    region_id: str
+    specialist: SpecialistType
+    model_assignment: str
+    priority: int
+
+
+@dataclass
+class RoutingPlan:
+    """Complete routing plan for all detected regions."""
+
+    entries: list[RoutingEntry] = field(default_factory=list)
+
+
+def generate_routing_plan(
+    regions: list[LayoutRegion],
+    quality: QualityAssessment,
+) -> RoutingPlan:
+    """Generate a deterministic routing plan for detected regions.
+
+    Args:
+        regions: Layout regions detected by DocLayout-YOLO.
+        quality: Quality assessment for priority calculation.
+
+    Returns:
+        RoutingPlan with one entry per region.
+    """
+    # Base priority: lower = higher priority
+    # Degraded documents get priority boost (lower number)
+    base_priority = 1 if quality.needs_enhancement else 5
+
+    entries: list[RoutingEntry] = []
+    for region in regions:
+        specialist = ROUTING_RULES.get(region.region_type, SpecialistType.TEXT)
+        model = MODEL_ASSIGNMENTS.get(specialist, "claude")
+
+        # Ambiguous regions get flagged (in full system: Claude classification call)
+        priority = base_priority
+        if region.confidence < AMBIGUITY_THRESHOLD:
+            # Ambiguous regions get slightly higher priority
+            priority = max(1, base_priority - 1)
+
+        entries.append(
+            RoutingEntry(
+                region_id=region.region_id,
+                specialist=specialist,
+                model_assignment=model,
+                priority=priority,
+            )
+        )
+
+    return RoutingPlan(entries=entries)
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/coordinator/test_routing.py -v`
+Expected: PASS (12 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/coordinator/routing.py tests/coordinator/test_routing.py
+git commit -m "feat: deterministic region-to-specialist routing with quality-based priority"
+```
+
+---
+
+### Task 10: Text Specialist
+
+**Files:**
+- Create: `src/agentic_extract/specialists/__init__.py`
+- Create: `src/agentic_extract/specialists/text.py`
+- Test: `tests/specialists/test_text.py`
+- Create: `tests/specialists/__init__.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/specialists/__init__.py
+```
+
+```python
+# tests/specialists/test_text.py
+"""Tests for the Text Specialist (PaddleOCR + Claude enhancement)."""
+import json
+import pathlib
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from PIL import Image
+
+from agentic_extract.models import BoundingBox, Region, RegionType, TextContent
+from agentic_extract.specialists.text import (
+    PaddleOCRTool,
+    TextSpecialist,
+    OCRResult,
+)
+from agentic_extract.tools.docker_runner import ToolOutput
+
+
+def test_ocr_result_dataclass():
+    result = OCRResult(
+        text="Hello world",
+        confidence=0.97,
+        per_char_confidences=[0.98, 0.99, 0.96, 0.97, 0.98],
+    )
+    assert result.text == "Hello world"
+    assert result.confidence == 0.97
+
+
+@patch.object(PaddleOCRTool, "_docker_tool")
+def test_paddleocr_extracts_text(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    img = Image.new("RGB", (400, 100), "white")
+    img_path = tmp_path / "text_region.png"
+    img.save(img_path)
+
+    paddle_output = json.dumps({
+        "text": "The quick brown fox",
+        "confidence": 0.96,
+        "per_char_confidences": [0.95, 0.97, 0.98, 0.94, 0.96],
+    })
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout=paddle_output, stderr="", exit_code=0, duration_ms=800,
+    )
+
+    tool = PaddleOCRTool()
+    result = tool.extract(img_path)
+
+    assert result.text == "The quick brown fox"
+    assert result.confidence == 0.96
+
+
+@patch.object(PaddleOCRTool, "_docker_tool")
+def test_paddleocr_handles_failure(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    img = Image.new("RGB", (100, 100), "white")
+    img_path = tmp_path / "bad.png"
+    img.save(img_path)
+
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout="", stderr="PaddleOCR error", exit_code=1, duration_ms=100,
+    )
+
+    tool = PaddleOCRTool()
+    with pytest.raises(RuntimeError, match="PaddleOCR failed"):
+        tool.extract(img_path)
+
+
+@pytest.mark.asyncio
+async def test_text_specialist_high_confidence_skips_vlm(tmp_path: pathlib.Path):
+    """When PaddleOCR confidence >= 0.95, the VLM call should be skipped."""
+    img = Image.new("RGB", (400, 100), "white")
+    img_path = tmp_path / "clean.png"
+    img.save(img_path)
+
+    mock_ocr = MagicMock()
+    mock_ocr.extract.return_value = OCRResult(
+        text="Clean text here",
+        confidence=0.98,
+        per_char_confidences=[0.99, 0.98, 0.97],
+    )
+
+    mock_vlm = AsyncMock()
+
+    specialist = TextSpecialist(ocr_tool=mock_ocr, vlm_client=mock_vlm)
+    region = await specialist.extract(
+        image_path=img_path,
+        region_id="r1",
+        page=1,
+        bbox=BoundingBox(x=0.05, y=0.10, w=0.90, h=0.05),
+    )
+
+    assert isinstance(region, Region)
+    assert region.type == RegionType.TEXT
+    assert isinstance(region.content, TextContent)
+    assert region.content.text == "Clean text here"
+    assert region.confidence == 0.98
+    # VLM should NOT have been called
+    mock_vlm.send_vision_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_text_specialist_low_confidence_calls_vlm(tmp_path: pathlib.Path):
+    """When PaddleOCR confidence < 0.95, Claude should enhance the text."""
+    img = Image.new("RGB", (400, 100), "white")
+    img_path = tmp_path / "degraded.png"
+    img.save(img_path)
+
+    mock_ocr = MagicMock()
+    mock_ocr.extract.return_value = OCRResult(
+        text="Th3 qu1ck br0wn f0x",
+        confidence=0.72,
+        per_char_confidences=[0.6, 0.8, 0.5],
+    )
+
+    from agentic_extract.clients.vlm import VLMResponse
+    mock_vlm = AsyncMock()
+    mock_vlm.send_vision_request.return_value = VLMResponse(
+        content={"corrected_text": "The quick brown fox"},
+        confidence=0.92,
+        model="claude-opus-4-20250514",
+        usage_tokens=200,
+        duration_ms=1500,
+    )
+
+    specialist = TextSpecialist(ocr_tool=mock_ocr, vlm_client=mock_vlm)
+    region = await specialist.extract(
+        image_path=img_path,
+        region_id="r1",
+        page=1,
+        bbox=BoundingBox(x=0.05, y=0.10, w=0.90, h=0.05),
+    )
+
+    assert region.content.text == "The quick brown fox"
+    assert region.confidence == 0.92
+    assert "claude" in region.extraction_method
+    mock_vlm.send_vision_request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_text_specialist_vlm_failure_falls_back_to_ocr(tmp_path: pathlib.Path):
+    """If Claude fails, the specialist should return OCR text as fallback."""
+    img = Image.new("RGB", (400, 100), "white")
+    img_path = tmp_path / "fallback.png"
+    img.save(img_path)
+
+    mock_ocr = MagicMock()
+    mock_ocr.extract.return_value = OCRResult(
+        text="Fa11back text",
+        confidence=0.80,
+        per_char_confidences=[0.7, 0.8, 0.9],
+    )
+
+    mock_vlm = AsyncMock()
+    mock_vlm.send_vision_request.side_effect = RuntimeError("API down")
+
+    specialist = TextSpecialist(ocr_tool=mock_ocr, vlm_client=mock_vlm)
+    region = await specialist.extract(
+        image_path=img_path,
+        region_id="r1",
+        page=1,
+        bbox=BoundingBox(x=0.0, y=0.0, w=1.0, h=1.0),
+    )
+
+    # Should fall back to OCR text
+    assert region.content.text == "Fa11back text"
+    assert region.confidence == 0.80
+    assert "paddleocr" in region.extraction_method
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/specialists/test_text.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.specialists'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/specialists/__init__.py
+"""Extraction specialists: Text, Table, Visual."""
+```
+
+```python
+# src/agentic_extract/specialists/text.py
+"""Text Specialist: PaddleOCR + Claude enhancement.
+
+Follows the OCR-then-LLM pattern. PaddleOCR extracts raw text with
+per-character confidence. If confidence is below threshold, Claude
+corrects errors using both the OCR output and the original image.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+from dataclasses import dataclass, field
+
+from agentic_extract.clients.vlm import VLMClient, VLMResponse
+from agentic_extract.models import BoundingBox, Region, RegionType, TextContent
+from agentic_extract.tools.docker_runner import DockerTool
+
+logger = logging.getLogger(__name__)
+
+# If PaddleOCR confidence is at or above this, skip VLM enhancement
+VLM_SKIP_THRESHOLD = 0.95
+
+CLAUDE_TEXT_PROMPT = """You are a document text extraction expert. You are given:
+1. Raw OCR output from PaddleOCR (may contain errors)
+2. The original image of the text region
+
+Your task: Correct any OCR errors and produce clean, accurate text.
+Return JSON: {{"corrected_text": "the corrected text here"}}
+
+OCR output: {ocr_text}
+OCR confidence: {ocr_confidence}
+
+Rules:
+- Fix obvious OCR errors (0/O confusion, 1/l confusion, etc.)
+- Preserve original formatting and line breaks
+- If uncertain about a character, keep the OCR version
+- Return null for corrected_text ONLY if the image is unreadable
+"""
+
+
+@dataclass
+class OCRResult:
+    """Raw OCR extraction result."""
+
+    text: str
+    confidence: float
+    per_char_confidences: list[float] = field(default_factory=list)
+
+
+class PaddleOCRTool:
+    """PaddleOCR 3.0 Docker wrapper for text extraction."""
+
+    IMAGE_NAME = "paddlepaddle/paddleocr:latest"
+
+    def __init__(
+        self,
+        image_name: str | None = None,
+        volumes: dict[str, str] | None = None,
+    ) -> None:
+        self._image_name = image_name or self.IMAGE_NAME
+        self._volumes = volumes or {}
+
+    @staticmethod
+    def _docker_tool(
+        image_name: str, volumes: dict[str, str],
+    ) -> DockerTool:
+        return DockerTool(
+            image_name=image_name,
+            default_timeout=120,
+            volumes=volumes,
+        )
+
+    def extract(self, image_path: pathlib.Path) -> OCRResult:
+        """Run PaddleOCR on an image and return text with confidence.
+
+        Args:
+            image_path: Path to the cropped region image.
+
+        Returns:
+            OCRResult with extracted text and confidence scores.
+
+        Raises:
+            RuntimeError: If PaddleOCR container fails.
+        """
+        tool = self._docker_tool(self._image_name, self._volumes)
+        result = tool.run([
+            "--image_dir", str(image_path),
+            "--type", "ocr",
+            "--output_format", "json",
+        ])
+
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"PaddleOCR failed (exit {result.exit_code}): {result.stderr}"
+            )
+
+        data = json.loads(result.stdout)
+        return OCRResult(
+            text=data.get("text", ""),
+            confidence=data.get("confidence", 0.0),
+            per_char_confidences=data.get("per_char_confidences", []),
+        )
+
+
+class TextSpecialist:
+    """Text extraction specialist using OCR-then-LLM pattern.
+
+    1. PaddleOCR extracts raw text with per-character confidence
+    2. If confidence < 0.95, Claude enhances the text using the
+       OCR output and original image
+    3. If Claude fails, falls back to raw OCR output
+    """
+
+    def __init__(
+        self,
+        ocr_tool: PaddleOCRTool | None = None,
+        vlm_client: VLMClient | None = None,
+    ) -> None:
+        self.ocr_tool = ocr_tool or PaddleOCRTool()
+        self.vlm_client = vlm_client
+
+    async def extract(
+        self,
+        image_path: pathlib.Path,
+        region_id: str,
+        page: int,
+        bbox: BoundingBox,
+    ) -> Region:
+        """Extract text from a region image.
+
+        Args:
+            image_path: Path to the cropped region image.
+            region_id: Unique identifier for this region.
+            page: Page number (1-based).
+            bbox: Normalized bounding box of this region.
+
+        Returns:
+            Region with TextContent populated.
+        """
+        # Stage 1: PaddleOCR
+        ocr_result = self.ocr_tool.extract(image_path)
+        extraction_method = "paddleocr_3.0"
+        final_text = ocr_result.text
+        final_confidence = ocr_result.confidence
+
+        # Stage 2: Claude enhancement (only if needed)
+        if (
+            ocr_result.confidence < VLM_SKIP_THRESHOLD
+            and self.vlm_client is not None
+        ):
+            try:
+                prompt = CLAUDE_TEXT_PROMPT.format(
+                    ocr_text=ocr_result.text,
+                    ocr_confidence=ocr_result.confidence,
+                )
+                vlm_response = await self.vlm_client.send_vision_request(
+                    image_path=image_path,
+                    prompt=prompt,
+                )
+                corrected = vlm_response.content
+                if isinstance(corrected, dict) and corrected.get("corrected_text"):
+                    final_text = corrected["corrected_text"]
+                    final_confidence = vlm_response.confidence
+                    extraction_method = f"paddleocr_3.0 + {vlm_response.model}"
+            except Exception as exc:
+                logger.warning(
+                    "VLM enhancement failed for region %s, using OCR fallback: %s",
+                    region_id, exc,
+                )
+
+        return Region(
+            id=region_id,
+            type=RegionType.TEXT,
+            subtype=None,
+            page=page,
+            bbox=bbox,
+            content=TextContent(text=final_text, markdown=final_text),
+            confidence=final_confidence,
+            extraction_method=extraction_method,
+            needs_review=final_confidence < 0.90,
+            review_reason=(
+                f"Text confidence {final_confidence:.2f} below 0.90 threshold"
+                if final_confidence < 0.90
+                else None
+            ),
+        )
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/specialists/test_text.py -v`
+Expected: PASS (7 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/specialists/__init__.py src/agentic_extract/specialists/text.py tests/specialists/__init__.py tests/specialists/test_text.py
+git commit -m "feat: Text Specialist with PaddleOCR extraction and Claude enhancement"
+```
+
+---
+
+### Task 11: Table Specialist
+
+**Files:**
+- Create: `src/agentic_extract/specialists/table.py`
+- Test: `tests/specialists/test_table.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/specialists/test_table.py
+"""Tests for the Table Specialist (Docling + Claude + Codex)."""
+import json
+import pathlib
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from PIL import Image
+
+from agentic_extract.clients.vlm import VLMResponse
+from agentic_extract.models import BoundingBox, Region, RegionType, TableContent
+from agentic_extract.specialists.table import (
+    DoclingTool,
+    DoclingResult,
+    TableSpecialist,
+)
+from agentic_extract.tools.docker_runner import ToolOutput
+
+
+def test_docling_result_dataclass():
+    result = DoclingResult(
+        html="<table><tr><td>A</td></tr></table>",
+        json_data={"headers": ["Col"], "rows": [{"Col": "A"}]},
+        confidence=0.95,
+    )
+    assert result.html.startswith("<table>")
+
+
+@patch.object(DoclingTool, "_docker_tool")
+def test_docling_extracts_table(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    img = Image.new("RGB", (800, 400), "white")
+    img_path = tmp_path / "table.png"
+    img.save(img_path)
+
+    docling_output = json.dumps({
+        "html": "<table><tr><th>Gene</th><th>Value</th></tr><tr><td>BRCA1</td><td>3.2</td></tr></table>",
+        "json": {"headers": ["Gene", "Value"], "rows": [{"Gene": "BRCA1", "Value": "3.2"}]},
+        "confidence": 0.94,
+    })
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout=docling_output, stderr="", exit_code=0, duration_ms=1200,
+    )
+
+    tool = DoclingTool()
+    result = tool.extract(img_path)
+    assert "BRCA1" in result.html
+    assert result.confidence == 0.94
+
+
+@patch.object(DoclingTool, "_docker_tool")
+def test_docling_handles_failure(mock_tool: MagicMock, tmp_path: pathlib.Path):
+    img = Image.new("RGB", (100, 100), "white")
+    img_path = tmp_path / "bad_table.png"
+    img.save(img_path)
+
+    mock_tool.return_value.run.return_value = ToolOutput(
+        stdout="", stderr="Docling error", exit_code=1, duration_ms=50,
+    )
+
+    tool = DoclingTool()
+    with pytest.raises(RuntimeError, match="Docling failed"):
+        tool.extract(img_path)
+
+
+@pytest.mark.asyncio
+async def test_table_specialist_full_pipeline(tmp_path: pathlib.Path):
+    """Test the full OCR-then-LLM pipeline: Docling -> Claude -> Codex."""
+    img = Image.new("RGB", (800, 400), "white")
+    img_path = tmp_path / "table_full.png"
+    img.save(img_path)
+
+    mock_docling = MagicMock()
+    mock_docling.extract.return_value = DoclingResult(
+        html="<table><tr><td>A</td><td>B</td></tr></table>",
+        json_data={"headers": ["A", "B"], "rows": []},
+        confidence=0.91,
+    )
+
+    mock_claude = AsyncMock()
+    mock_claude.send_vision_request.return_value = VLMResponse(
+        content={"corrections": [], "verified": True},
+        confidence=0.93,
+        model="claude-opus-4-20250514",
+        usage_tokens=300,
+        duration_ms=2000,
+    )
+
+    mock_codex = AsyncMock()
+    mock_codex.send_vision_request.return_value = VLMResponse(
+        content={"headers": ["A", "B"], "rows": [{"A": "1", "B": "2"}]},
+        confidence=0.95,
+        model="gpt-4o",
+        usage_tokens=250,
+        duration_ms=1500,
+    )
+
+    specialist = TableSpecialist(
+        docling_tool=mock_docling,
+        claude_client=mock_claude,
+        codex_client=mock_codex,
+    )
+
+    region = await specialist.extract(
+        image_path=img_path,
+        region_id="t1",
+        page=2,
+        bbox=BoundingBox(x=0.05, y=0.2, w=0.9, h=0.4),
+    )
+
+    assert isinstance(region, Region)
+    assert region.type == RegionType.TABLE
+    assert isinstance(region.content, TableContent)
+    assert region.content.html is not None
+    assert "docling" in region.extraction_method
+    mock_claude.send_vision_request.assert_called_once()
+    mock_codex.send_vision_request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_table_specialist_without_codex(tmp_path: pathlib.Path):
+    """Table specialist should work even without Codex (just Docling + Claude)."""
+    img = Image.new("RGB", (800, 400), "white")
+    img_path = tmp_path / "table_no_codex.png"
+    img.save(img_path)
+
+    mock_docling = MagicMock()
+    mock_docling.extract.return_value = DoclingResult(
+        html="<table><tr><td>X</td></tr></table>",
+        json_data={"headers": ["X"], "rows": [{"X": "1"}]},
+        confidence=0.88,
+    )
+
+    mock_claude = AsyncMock()
+    mock_claude.send_vision_request.return_value = VLMResponse(
+        content={"corrections": [], "verified": True},
+        confidence=0.90,
+        model="claude-opus-4-20250514",
+        usage_tokens=200,
+        duration_ms=1000,
+    )
+
+    specialist = TableSpecialist(
+        docling_tool=mock_docling,
+        claude_client=mock_claude,
+        codex_client=None,
+    )
+
+    region = await specialist.extract(
+        image_path=img_path,
+        region_id="t2",
+        page=1,
+        bbox=BoundingBox(x=0.0, y=0.0, w=1.0, h=1.0),
+    )
+
+    assert region.content.json_data["headers"] == ["X"]
+    assert "codex" not in region.extraction_method.lower()
+
+
+@pytest.mark.asyncio
+async def test_table_specialist_vlm_failures_degrade_gracefully(tmp_path: pathlib.Path):
+    """If both Claude and Codex fail, fall back to raw Docling output."""
+    img = Image.new("RGB", (800, 400), "white")
+    img_path = tmp_path / "table_fallback.png"
+    img.save(img_path)
+
+    mock_docling = MagicMock()
+    mock_docling.extract.return_value = DoclingResult(
+        html="<table><tr><td>Z</td></tr></table>",
+        json_data={"headers": ["Z"], "rows": [{"Z": "9"}]},
+        confidence=0.85,
+    )
+
+    mock_claude = AsyncMock()
+    mock_claude.send_vision_request.side_effect = RuntimeError("API error")
+
+    mock_codex = AsyncMock()
+    mock_codex.send_vision_request.side_effect = RuntimeError("API error")
+
+    specialist = TableSpecialist(
+        docling_tool=mock_docling,
+        claude_client=mock_claude,
+        codex_client=mock_codex,
+    )
+
+    region = await specialist.extract(
+        image_path=img_path,
+        region_id="t3",
+        page=1,
+        bbox=BoundingBox(x=0.0, y=0.0, w=1.0, h=1.0),
+    )
+
+    assert region.content.html == "<table><tr><td>Z</td></tr></table>"
+    assert region.confidence == 0.85
+    assert region.extraction_method == "docling"
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/specialists/test_table.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.specialists.table'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/specialists/table.py
+"""Table Specialist: Docling + Claude reasoning + Codex schema enforcement.
+
+Follows the OCR-then-LLM pattern:
+1. Docling extracts HTML table structure (97.9% accuracy on complex tables)
+2. Claude reasons about merged cells, ambiguous headers, multi-page tables
+3. Codex enforces the JSON output schema via Structured Outputs API
+"""
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+from dataclasses import dataclass, field
+from typing import Any
+
+from agentic_extract.clients.vlm import VLMClient, VLMResponse
+from agentic_extract.models import BoundingBox, Region, RegionType, TableContent
+from agentic_extract.tools.docker_runner import DockerTool
+
+logger = logging.getLogger(__name__)
+
+CLAUDE_TABLE_PROMPT = """You are a document table extraction expert. You are given:
+1. An HTML table extracted by Docling from a document
+2. The original image of the table region
+
+Your task: Verify the table extraction and identify any errors.
+Check for: merged cells, ambiguous headers, missing data, misaligned columns.
+
+HTML table from Docling:
+{html_table}
+
+Return JSON:
+{{
+  "corrections": [list of correction descriptions],
+  "verified": true/false (true if table looks correct)
+}}
+"""
+
+CODEX_TABLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headers": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "rows": {
+            "type": "array",
+            "items": {"type": "object"},
+        },
+    },
+    "required": ["headers", "rows"],
+}
+
+CODEX_TABLE_PROMPT = """Extract the table data from this image into structured JSON.
+Use the exact column headers visible in the table.
+Each row should be an object mapping header names to cell values.
+Return null for any cell that is empty or unreadable.
+"""
+
+
+@dataclass
+class DoclingResult:
+    """Raw Docling table extraction result."""
+
+    html: str
+    json_data: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0
+
+
+class DoclingTool:
+    """Docling Docker wrapper for table structure extraction."""
+
+    IMAGE_NAME = "docling:latest"
+
+    def __init__(
+        self,
+        image_name: str | None = None,
+        volumes: dict[str, str] | None = None,
+    ) -> None:
+        self._image_name = image_name or self.IMAGE_NAME
+        self._volumes = volumes or {}
+
+    @staticmethod
+    def _docker_tool(
+        image_name: str, volumes: dict[str, str],
+    ) -> DockerTool:
+        return DockerTool(
+            image_name=image_name,
+            default_timeout=180,
+            volumes=volumes,
+        )
+
+    def extract(self, image_path: pathlib.Path) -> DoclingResult:
+        """Run Docling on a table image.
+
+        Args:
+            image_path: Path to the cropped table region image.
+
+        Returns:
+            DoclingResult with HTML table and JSON data.
+
+        Raises:
+            RuntimeError: If Docling container fails.
+        """
+        tool = self._docker_tool(self._image_name, self._volumes)
+        result = tool.run([
+            "--input", str(image_path),
+            "--format", "json",
+        ])
+
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Docling failed (exit {result.exit_code}): {result.stderr}"
+            )
+
+        data = json.loads(result.stdout)
+        return DoclingResult(
+            html=data.get("html", ""),
+            json_data=data.get("json", {}),
+            confidence=data.get("confidence", 0.0),
+        )
+
+
+class TableSpecialist:
+    """Table extraction specialist: Docling + Claude + Codex.
+
+    Pipeline:
+    1. Docling extracts HTML table structure
+    2. Claude verifies and reasons about ambiguous cells
+    3. Codex enforces JSON schema via Structured Outputs
+    """
+
+    def __init__(
+        self,
+        docling_tool: DoclingTool | None = None,
+        claude_client: VLMClient | None = None,
+        codex_client: VLMClient | None = None,
+    ) -> None:
+        self.docling_tool = docling_tool or DoclingTool()
+        self.claude_client = claude_client
+        self.codex_client = codex_client
+
+    async def extract(
+        self,
+        image_path: pathlib.Path,
+        region_id: str,
+        page: int,
+        bbox: BoundingBox,
+    ) -> Region:
+        """Extract a table from a region image.
+
+        Args:
+            image_path: Path to the cropped table image.
+            region_id: Unique identifier for this region.
+            page: Page number (1-based).
+            bbox: Normalized bounding box of this region.
+
+        Returns:
+            Region with TableContent populated.
+        """
+        # Stage 1: Docling
+        docling_result = self.docling_tool.extract(image_path)
+        extraction_method = "docling"
+        final_html = docling_result.html
+        final_json = docling_result.json_data
+        final_confidence = docling_result.confidence
+
+        # Stage 2: Claude reasoning about ambiguous cells
+        if self.claude_client is not None:
+            try:
+                prompt = CLAUDE_TABLE_PROMPT.format(html_table=docling_result.html)
+                claude_resp = await self.claude_client.send_vision_request(
+                    image_path=image_path,
+                    prompt=prompt,
+                )
+                extraction_method += f" + {claude_resp.model}"
+                # If Claude verified the table, boost confidence slightly
+                if isinstance(claude_resp.content, dict):
+                    if claude_resp.content.get("verified", False):
+                        final_confidence = max(
+                            final_confidence, claude_resp.confidence,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "Claude table verification failed for %s: %s",
+                    region_id, exc,
+                )
+
+        # Stage 3: Codex schema enforcement
+        if self.codex_client is not None:
+            try:
+                codex_resp = await self.codex_client.send_vision_request(
+                    image_path=image_path,
+                    prompt=CODEX_TABLE_PROMPT,
+                    schema=CODEX_TABLE_SCHEMA,
+                )
+                if isinstance(codex_resp.content, dict):
+                    if "headers" in codex_resp.content:
+                        final_json = codex_resp.content
+                        final_confidence = max(
+                            final_confidence, codex_resp.confidence,
+                        )
+                extraction_method += f" + {codex_resp.model}"
+            except Exception as exc:
+                logger.warning(
+                    "Codex schema enforcement failed for %s: %s",
+                    region_id, exc,
+                )
+
+        return Region(
+            id=region_id,
+            type=RegionType.TABLE,
+            subtype=None,
+            page=page,
+            bbox=bbox,
+            content=TableContent(
+                html=final_html,
+                json_data=final_json,
+                cell_bboxes=[],
+            ),
+            confidence=final_confidence,
+            extraction_method=extraction_method,
+            needs_review=final_confidence < 0.90,
+            review_reason=(
+                f"Table confidence {final_confidence:.2f} below 0.90 threshold"
+                if final_confidence < 0.90
+                else None
+            ),
+        )
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/specialists/test_table.py -v`
+Expected: PASS (7 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/specialists/table.py tests/specialists/test_table.py
+git commit -m "feat: Table Specialist with Docling extraction, Claude verification, Codex schema enforcement"
+```
+
+---
+
+### Task 12: Basic Assembly + Output
+
+**Files:**
+- Create: `src/agentic_extract/coordinator/assembly.py`
+- Test: `tests/coordinator/test_assembly.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/coordinator/test_assembly.py
+"""Tests for result assembly and output generation."""
+import json
+from datetime import datetime, timezone
+
+import pytest
+
+from agentic_extract.coordinator.assembly import (
+    assemble,
+    generate_json_output,
+    generate_markdown_output,
+)
+from agentic_extract.models import (
+    AuditTrail,
+    BoundingBox,
+    DocumentMetadata,
+    ExtractionResult,
+    ProcessingStage,
+    Region,
+    RegionType,
+    TableContent,
+    TextContent,
+)
+
+
+def _make_text_region(rid: str, page: int, text: str, conf: float) -> Region:
+    return Region(
+        id=rid,
+        type=RegionType.TEXT,
+        subtype=None,
+        page=page,
+        bbox=BoundingBox(x=0.05, y=0.10, w=0.90, h=0.10),
+        content=TextContent(text=text, markdown=text),
+        confidence=conf,
+        extraction_method="paddleocr_3.0",
+    )
+
+
+def _make_table_region(rid: str, page: int, conf: float) -> Region:
+    return Region(
+        id=rid,
+        type=RegionType.TABLE,
+        subtype=None,
+        page=page,
+        bbox=BoundingBox(x=0.05, y=0.30, w=0.90, h=0.30),
+        content=TableContent(
+            html="<table><tr><th>Gene</th><th>Value</th></tr><tr><td>BRCA1</td><td>3.2</td></tr></table>",
+            json_data={"headers": ["Gene", "Value"], "rows": [{"Gene": "BRCA1", "Value": "3.2"}]},
+            cell_bboxes=[],
+        ),
+        confidence=conf,
+        extraction_method="docling + claude-opus-4-20250514",
+    )
+
+
+def _make_metadata() -> DocumentMetadata:
+    return DocumentMetadata(
+        id="doc-test-001",
+        source="test_paper.pdf",
+        page_count=2,
+        processing_timestamp=datetime(2026, 2, 23, 12, 0, 0, tzinfo=timezone.utc),
+        approach="B",
+        total_confidence=0.93,
+        processing_time_ms=5000,
+    )
+
+
+def test_assemble_produces_extraction_result():
+    regions = [
+        _make_text_region("r1", page=1, text="Introduction paragraph.", conf=0.97),
+        _make_table_region("r2", page=1, conf=0.94),
+    ]
+    reading_order = ["r1", "r2"]
+    metadata = _make_metadata()
+
+    result = assemble(regions, reading_order, metadata)
+
+    assert isinstance(result, ExtractionResult)
+    assert result.document.source == "test_paper.pdf"
+    assert len(result.regions) == 2
+    assert result.regions[0].id == "r1"  # reading order preserved
+    assert result.regions[1].id == "r2"
+    assert result.audit_trail is not None
+
+
+def test_assemble_orders_by_reading_order():
+    """Regions should appear in reading_order sequence, not insertion order."""
+    regions = [
+        _make_text_region("r2", page=1, text="Second", conf=0.95),
+        _make_text_region("r1", page=1, text="First", conf=0.97),
+    ]
+    reading_order = ["r1", "r2"]
+
+    result = assemble(regions, reading_order, _make_metadata())
+    assert result.regions[0].id == "r1"
+    assert result.regions[1].id == "r2"
+
+
+def test_generate_markdown_output():
+    regions = [
+        _make_text_region("r1", page=1, text="This is the introduction.", conf=0.97),
+        _make_table_region("r2", page=1, conf=0.94),
+        _make_text_region("r3", page=2, text="Conclusion paragraph.", conf=0.91),
+    ]
+    metadata = _make_metadata()
+
+    md = generate_markdown_output(regions, metadata)
+
+    assert "test_paper.pdf" in md
+    assert "This is the introduction." in md
+    assert "Gene" in md  # table header
+    assert "BRCA1" in md  # table data
+    assert "Conclusion paragraph." in md
+    assert "0.94" in md  # table confidence annotation
+
+
+def test_generate_markdown_flags_low_confidence():
+    regions = [
+        _make_text_region("r1", page=1, text="Unclear text", conf=0.72),
+    ]
+    regions[0] = Region(
+        **{**regions[0].model_dump(), "needs_review": True, "review_reason": "Low confidence"},
+    )
+    metadata = _make_metadata()
+
+    md = generate_markdown_output(regions, metadata)
+    assert "NEEDS REVIEW" in md
+
+
+def test_generate_json_output():
+    regions = [
+        _make_text_region("r1", page=1, text="Hello", conf=0.97),
+    ]
+    metadata = _make_metadata()
+    audit = AuditTrail(
+        models_used=["paddleocr_3.0"],
+        total_llm_calls=0,
+        re_extractions=0,
+        fields_flagged=0,
+        processing_stages=[ProcessingStage(stage="ingestion", duration_ms=100)],
+    )
+
+    json_str = generate_json_output(regions, metadata, audit)
+    parsed = json.loads(json_str)
+
+    assert parsed["document"]["source"] == "test_paper.pdf"
+    assert len(parsed["regions"]) == 1
+    assert parsed["regions"][0]["id"] == "r1"
+    assert parsed["audit_trail"]["total_llm_calls"] == 0
+
+
+def test_assemble_empty_document():
+    """Empty document with no regions should still produce valid output."""
+    result = assemble([], [], _make_metadata())
+    assert result.regions == []
+    assert result.markdown is not None
+    assert len(result.markdown) > 0  # at least the header
+
+
+def test_assemble_json_roundtrip():
+    """The assembled result must serialize and deserialize cleanly."""
+    regions = [
+        _make_text_region("r1", page=1, text="Test", conf=0.95),
+        _make_table_region("r2", page=2, conf=0.92),
+    ]
+    result = assemble(regions, ["r1", "r2"], _make_metadata())
+
+    json_str = result.model_dump_json()
+    restored = ExtractionResult.model_validate_json(json_str)
+    assert restored.document.id == "doc-test-001"
+    assert len(restored.regions) == 2
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/coordinator/test_assembly.py -v`
+Expected: FAIL with "ModuleNotFoundError: No module named 'agentic_extract.coordinator.assembly'"
+
+**Step 3: Write minimal implementation**
+
+```python
+# src/agentic_extract/coordinator/assembly.py
+"""Result assembly: merge specialist outputs into final Markdown + JSON.
+
+Takes extracted regions (ordered by reading order), document metadata,
+and produces the complete ExtractionResult with both Markdown and
+JSON representations.
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+from agentic_extract.models import (
+    AuditTrail,
+    DocumentMetadata,
+    ExtractionResult,
+    ProcessingStage,
+    Region,
+    RegionType,
+    TableContent,
+    TextContent,
+)
+
+
+def _region_to_markdown(region: Region) -> str:
+    """Convert a single region to its Markdown representation."""
+    lines: list[str] = []
+    review_tag = " [NEEDS REVIEW]" if region.needs_review else ""
+
+    if region.type == RegionType.TEXT:
+        content = region.content
+        if isinstance(content, TextContent):
+            lines.append(f"{content.markdown}{review_tag}")
+            lines.append("")
+            lines.append(
+                f"*Confidence: {region.confidence:.2f} | "
+                f"Method: {region.extraction_method}*"
+            )
+
+    elif region.type == RegionType.TABLE:
+        content = region.content
+        if isinstance(content, TableContent) and content.json_data:
+            headers = content.json_data.get("headers", [])
+            rows = content.json_data.get("rows", [])
+
+            lines.append(f"**Table (Page {region.page})**{review_tag}")
+            lines.append("")
+            if headers:
+                lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+                lines.append("| " + " | ".join("---" for _ in headers) + " |")
+                for row in rows:
+                    vals = [str(row.get(h, "")) for h in headers]
+                    lines.append("| " + " | ".join(vals) + " |")
+            lines.append("")
+            lines.append(
+                f"*Confidence: {region.confidence:.2f} | "
+                f"Method: {region.extraction_method}*"
+            )
+
+    elif region.type == RegionType.FIGURE:
+        lines.append(f"**Figure (Page {region.page})**{review_tag}")
+        lines.append("")
+        if hasattr(region.content, "description"):
+            lines.append(region.content.description)
+        lines.append("")
+        lines.append(
+            f"*Confidence: {region.confidence:.2f} | "
+            f"Method: {region.extraction_method}*"
+        )
+
+    elif region.type in (RegionType.HANDWRITING, RegionType.FORMULA):
+        label = region.type.value.capitalize()
+        lines.append(f"**{label} (Page {region.page})**{review_tag}")
+        lines.append("")
+        if hasattr(region.content, "text"):
+            lines.append(region.content.text)
+        elif hasattr(region.content, "latex"):
+            lines.append(f"$${region.content.latex}$$")
+        lines.append("")
+        lines.append(
+            f"*Confidence: {region.confidence:.2f} | "
+            f"Method: {region.extraction_method}*"
+        )
+
+    else:
+        lines.append(f"**{region.type.value} (Page {region.page})**{review_tag}")
+
+    return "\n".join(lines)
+
+
+def generate_markdown_output(
+    regions: list[Region],
+    metadata: DocumentMetadata,
+) -> str:
+    """Generate the full Markdown output document.
+
+    Args:
+        regions: Regions in reading order.
+        metadata: Document-level metadata.
+
+    Returns:
+        Complete Markdown string.
+    """
+    lines: list[str] = []
+    lines.append(f"# Document: {metadata.source}")
+    lines.append("")
+    lines.append(
+        f"**Source:** {metadata.source} | "
+        f"**Pages:** {metadata.page_count} | "
+        f"**Processed:** {metadata.processing_timestamp.strftime('%Y-%m-%d')} | "
+        f"**Confidence:** {metadata.total_confidence:.2f}"
+    )
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for region in regions:
+        lines.append(_region_to_markdown(region))
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def generate_json_output(
+    regions: list[Region],
+    metadata: DocumentMetadata,
+    audit_trail: AuditTrail,
+    extracted_entities: dict | None = None,
+) -> str:
+    """Generate the full JSON output string.
+
+    Args:
+        regions: Regions in reading order.
+        metadata: Document-level metadata.
+        audit_trail: Processing audit trail.
+        extracted_entities: Optional entity extractions.
+
+    Returns:
+        JSON string conforming to the agentic-extract/v1 schema.
+    """
+    result = ExtractionResult(
+        document=metadata,
+        markdown=generate_markdown_output(regions, metadata),
+        regions=regions,
+        extracted_entities=extracted_entities or {},
+        audit_trail=audit_trail,
+    )
+    return result.model_dump_json(indent=2)
+
+
+def assemble(
+    regions: list[Region],
+    reading_order: list[str],
+    metadata: DocumentMetadata,
+) -> ExtractionResult:
+    """Assemble specialist outputs into the final ExtractionResult.
+
+    Args:
+        regions: All extracted regions (unordered).
+        reading_order: Ordered list of region IDs.
+        metadata: Document metadata.
+
+    Returns:
+        Complete ExtractionResult with Markdown, JSON, and audit trail.
+    """
+    # Build region lookup and order by reading order
+    region_map = {r.id: r for r in regions}
+    ordered_regions: list[Region] = []
+    for rid in reading_order:
+        if rid in region_map:
+            ordered_regions.append(region_map[rid])
+    # Append any regions not in reading_order (safety net)
+    seen = set(reading_order)
+    for r in regions:
+        if r.id not in seen:
+            ordered_regions.append(r)
+
+    # Collect extraction methods used
+    models_used = sorted(set(
+        method.strip()
+        for r in ordered_regions
+        for method in r.extraction_method.split("+")
+    ))
+
+    # Count LLM calls (heuristic: count model names that are VLMs)
+    vlm_indicators = {"claude", "codex", "gpt", "opus", "sonnet"}
+    llm_calls = sum(
+        1 for r in ordered_regions
+        for part in r.extraction_method.lower().split("+")
+        if any(v in part for v in vlm_indicators)
+    )
+
+    flagged = sum(1 for r in ordered_regions if r.needs_review)
+
+    audit_trail = AuditTrail(
+        models_used=models_used,
+        total_llm_calls=llm_calls,
+        re_extractions=0,
+        fields_flagged=flagged,
+        processing_stages=[
+            ProcessingStage(stage="assembly", duration_ms=0),
+        ],
+    )
+
+    markdown = generate_markdown_output(ordered_regions, metadata)
+
+    return ExtractionResult(
+        document=metadata,
+        markdown=markdown,
+        regions=ordered_regions,
+        extracted_entities={},
+        audit_trail=audit_trail,
+    )
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/coordinator/test_assembly.py -v`
+Expected: PASS (8 passed)
+
+**Step 5: Commit**
+
+```bash
+git add src/agentic_extract/coordinator/assembly.py tests/coordinator/test_assembly.py
+git commit -m "feat: result assembly with Markdown and JSON output generation"
+```
+
+---
+
+## Phase 1 Summary
+
+After completing Tasks 1-12, the project has the following structure:
+
+```
+agentic-extract/
+    pyproject.toml
+    .gitignore
+    src/agentic_extract/
+        __init__.py
+        py.typed
+        models.py                          # Core Pydantic v2 data models
+        tools/
+            __init__.py
+            docker_runner.py               # Docker container execution
+        clients/
+            __init__.py
+            vlm.py                         # Claude + Codex VLM clients
+        coordinator/
+            __init__.py
+            ingestion.py                   # PDF/image ingestion
+            layout.py                      # DocLayout-YOLO layout detection
+            reading_order.py               # Surya reading order + fallback
+            quality.py                     # DPI/skew/degradation assessment
+            routing.py                     # Deterministic specialist routing
+            assembly.py                    # Result assembly + output generation
+        specialists/
+            __init__.py
+            text.py                        # PaddleOCR + Claude text extraction
+            table.py                       # Docling + Claude + Codex table extraction
+    tests/
+        conftest.py
+        test_scaffolding.py
+        test_models.py
+        tools/
+            __init__.py
+            test_docker_runner.py
+        clients/
+            __init__.py
+            test_vlm.py
+        coordinator/
+            __init__.py
+            test_ingestion.py
+            test_layout.py
+            test_reading_order.py
+            test_quality.py
+            test_routing.py
+            test_assembly.py
+        specialists/
+            __init__.py
+            test_text.py
+            test_table.py
+```
+
+**Total tests:** ~80 test cases across 12 test files
+**Total source files:** 13 Python modules
+**Key patterns established:**
+- TDD workflow (test first, implement, verify)
+- Docker-only tool execution (no local installs)
+- OCR-then-LLM extraction pattern
+- Graceful degradation (VLM failures fall back to OCR-only)
+- Pydantic v2 models for all data structures
+- Normalized bounding boxes [0, 1] throughout
+
+**Phase 2 (Tasks 13-24)** will add: Visual Specialist, Handwriting Specialist, the 5-layer Validator, re-extraction loop with model switching, confidence calibration, and end-to-end integration tests.
