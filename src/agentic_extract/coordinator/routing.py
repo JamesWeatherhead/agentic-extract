@@ -99,3 +99,35 @@ def generate_routing_plan(
         )
 
     return RoutingPlan(entries=entries)
+
+
+def route_regions(
+    regions: list[LayoutRegion],
+) -> dict[str, list[LayoutRegion]]:
+    """Group layout regions by specialist type for pipeline dispatch.
+
+    Convenience function used by the Pipeline orchestrator. Buckets each
+    region into "text", "table", or "visual" based on deterministic rules.
+
+    Args:
+        regions: Layout regions detected by DocLayout-YOLO.
+
+    Returns:
+        Dict with keys "text", "table", "visual", each mapping to a list
+        of LayoutRegion objects assigned to that specialist.
+    """
+    buckets: dict[str, list[LayoutRegion]] = {
+        "text": [],
+        "table": [],
+        "visual": [],
+    }
+    specialist_to_bucket = {
+        SpecialistType.TEXT: "text",
+        SpecialistType.TABLE: "table",
+        SpecialistType.VISUAL: "visual",
+    }
+    for region in regions:
+        specialist = ROUTING_RULES.get(region.region_type, SpecialistType.TEXT)
+        bucket = specialist_to_bucket.get(specialist, "text")
+        buckets[bucket].append(region)
+    return buckets

@@ -150,6 +150,37 @@ def generate_json_output(
     return result.model_dump_json(indent=2)
 
 
+def assemble_result(
+    regions: list[Region],
+    metadata: DocumentMetadata,
+    audit_trail: AuditTrail,
+    extracted_entities: dict | None = None,
+) -> ExtractionResult:
+    """Assemble regions into a final ExtractionResult with a pre-built audit trail.
+
+    This is the pipeline-facing assembly function. Unlike ``assemble``, it
+    accepts a fully constructed AuditTrail (with per-stage timing from the
+    pipeline orchestrator) instead of building one from scratch.
+
+    Args:
+        regions: Extracted regions in reading order.
+        metadata: Document metadata.
+        audit_trail: Pre-built audit trail from the pipeline.
+        extracted_entities: Optional entity extractions.
+
+    Returns:
+        Complete ExtractionResult.
+    """
+    markdown = generate_markdown_output(regions, metadata)
+    return ExtractionResult(
+        document=metadata,
+        markdown=markdown,
+        regions=regions,
+        extracted_entities=extracted_entities or {},
+        audit_trail=audit_trail,
+    )
+
+
 def assemble(
     regions: list[Region],
     reading_order: list[str],
