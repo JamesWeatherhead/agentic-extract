@@ -54,7 +54,7 @@ Agentic Extract fills every one of these gaps.
 | Scientific coverage | Generic figure handling only | DECIMER (molecules), GelGenie (gels), DePlot (charts), pix2tex (math), FigEx2 (multi-panel) |
 | Confidence scoring | Paywalled at $2,000+/month | Calibrated per-field confidence, included by default |
 | Visual grounding | Paywalled at higher tiers | Region + cell-level bounding boxes, included by default |
-| Cross-page reasoning | Processes pages independently | Claude 200K context enables document-level understanding |
+| Cross-page reasoning | Processes pages independently | Claude 1M token context enables document-level understanding |
 | Transparency | Opaque credit system | Per-model token pricing, full audit trail, extraction provenance |
 | Vendor lock-in | Fully proprietary | Open-source foundation; every component replaceable |
 
@@ -258,7 +258,7 @@ Each specialist follows the **OCR-then-LLM** pattern proven by AWS ICCV 2025 res
 |------|---------------|-------------------|-----------|
 | Table reasoning (merged cells, no gridlines) | **Claude** | Hallucination rate 0.09% (vs GPT-4o 0.15%) | Lower hallucination critical for financial/scientific tables |
 | Chart interpretation and data extraction | **Claude** | ChartQA 90.8% (vs GPT-4o 85.7%); CharXiv reasoning ~60% (vs 47.1%) | Clear benchmark lead on chart reasoning tasks |
-| Long document cross-page reasoning | **Claude** | 200K token context window | Only model with sufficient context for full-document reasoning |
+| Long document cross-page reasoning | **Claude** | 1M token context window | Only model with sufficient context for full-document reasoning |
 | Identity document extraction | **Claude** | GPT-4o refuses due to content policy | No alternative; GPT-4o explicitly blocks identity documents |
 | Semantic validation ("do these fields make sense?") | **Claude** | DocVQA 95.2% (vs GPT-4o 92.8%) | Best general document understanding |
 | Ambiguous region classification | **Claude** | Broader document understanding benchmarks | Used only as tiebreaker when deterministic classification fails |
@@ -727,7 +727,7 @@ The architecture is designed so that Approach C's additional agents can be added
 - A new **Consensus Judge** agent is added between the Validator and final output
 - The Judge activates ONLY when the Validator's re-extraction loop exhausts retries without resolution
 - The Judge loads the original document region, the two (or three) candidate extractions, and their confidence scores
-- Claude (with full document context, 200K window) acts as tiebreaker
+- Claude (with full document context, 1M token window) acts as tiebreaker
 - If Claude's tiebreaker agrees with one candidate, accept it with boosted confidence
 - If Claude produces a fourth unique answer, flag for human review with all candidates
 
@@ -741,7 +741,7 @@ The architecture is designed so that Approach C's additional agents can be added
 
 - A new **Semantic Auditor** agent runs once per document, after all fields are extracted and validated
 - Assembles the complete Markdown output and the complete JSON output
-- Sends both to Claude (200K context) with the prompt: "Given this document in Markdown and the structured extraction in JSON, identify any inconsistencies, missing data, or extraction errors. Cross-reference figures with their captions, tables with their references in the text, and entities across sections."
+- Sends both to Claude (1M token context) with the prompt: "Given this document in Markdown and the structured extraction in JSON, identify any inconsistencies, missing data, or extraction errors. Cross-reference figures with their captions, tables with their references in the text, and entities across sections."
 - For each identified issue, flags the relevant JSON field
 - If issues are found, triggers targeted re-extraction of affected regions
 
@@ -940,7 +940,7 @@ The architecture is designed so that Approach C's additional agents can be added
 | Handwritten math (LaTeX) | Yes (pix2tex + GOT-OCR) | No |
 | Multi-panel figure splitting | Yes (FigEx2) | No |
 | Degraded scan recovery | Yes (DocEnTr) | Limited |
-| Cross-page reasoning | Yes (Claude 200K context) | No |
+| Cross-page reasoning | Yes (Claude 1M token context) | No |
 | Identity documents | Yes (Claude; GPT-4o refuses) | Partial |
 | Per-field confidence scoring | Yes (calibrated, included) | Paywalled ($2,000+/mo) |
 | Visual grounding (bounding boxes) | Yes (region + cell level) | Paywalled (higher tiers) |
@@ -976,7 +976,7 @@ Agentic Extract v1 (Approach B) is considered complete when:
 | Codex for figure matching | SciFIBench: 75.4% vs Claude ~53% | Roberts et al., NeurIPS 2024 |
 | Codex for schema enforcement | Native Structured Outputs API | OpenAI documentation |
 | Claude for hallucination prevention | 0.09% vs GPT-4o 0.15% | CodeSOTA 2025 |
-| Claude for long documents | 200K token context window | Anthropic model card |
+| Claude for long documents | 1M token context window | Anthropic model card |
 | Confidence with rejection = 99.9% | Production confidence patterns | Handwriting extraction research |
 | Docling for tables | 97.9% on complex tables | Docling benchmark evaluation |
 | DePlot for chart-to-table | 29.4% improvement over prior SOTA | Liu et al., ACL Findings 2023 |
