@@ -73,8 +73,40 @@ class FormulaContent(BaseModel):
     mathml: str | None = None
 
 
+class ChartAxis(BaseModel):
+    """Axis definition for chart content."""
+
+    label: str
+    type: str = Field(
+        ..., description="Axis type: categorical, numerical, or temporal",
+    )
+
+
+class DataSeries(BaseModel):
+    """A single data series in a chart."""
+
+    name: str
+    values: list[float | str | None] = Field(default_factory=list)
+
+
+class ChartContent(BaseModel):
+    """Content for chart/graph regions (structured DePlot + Claude output)."""
+
+    figure_type: str = Field(
+        ..., description="Chart type: bar_chart, line_chart, scatter_plot, pie_chart, etc.",
+    )
+    title: str | None = None
+    x_axis: ChartAxis | None = None
+    y_axis: ChartAxis | None = None
+    data_series: list[DataSeries] = Field(default_factory=list)
+    description: str = ""
+
+
 # Union type for region content
-RegionContent = TextContent | TableContent | FigureContent | HandwritingContent | FormulaContent
+RegionContent = (
+    TextContent | TableContent | FigureContent | ChartContent
+    | HandwritingContent | FormulaContent
+)
 
 
 class Region(BaseModel):
