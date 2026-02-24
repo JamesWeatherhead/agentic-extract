@@ -865,7 +865,15 @@ The architecture is designed so that Approach C's additional agents can be added
 
 **Implication:** All prompts include explicit instructions to output null rather than guess. The Validator's semantic check (Layer 3) specifically looks for implausible values that may indicate hallucination.
 
-### Decision 5: Confidence-Based Rejection, Not Confidence-Based Filtering
+### Decision 5: Never Fabricate Quantitative Data from Figures
+
+**Choice:** When extracting from scientific figures (charts, plots, graphs, KM curves), the system extracts ONLY what is certain: axis labels, legend entries, chart type, caption text, and qualitative trend descriptions. It NEVER generates a data table of numerical values estimated from pixel positions. Quantitative data points from figures are always `null` with `needs_review: true` and a note directing the user to contact authors or check supplementary materials.
+
+**Research justification:** VLMs looking at chart images produce plausible-looking numbers that may or may not be correct. Presenting hallucinated data points in a precise-looking table is actively dangerous for downstream scientific use (meta-analyses, systematic reviews). There is no reliable way to validate pixel-estimated values without the original source data. A null is honest; a guess dressed up as extracted data is a fabrication.
+
+**Implication:** Figure extraction outputs contain: chart type, axis metadata, legend, caption, and qualitative description. The `data_points` field is always `null` unless the figure includes an embedded data table with readable text (which can be OCR-verified). Confidence for figure regions with no quantitative extraction is capped at 0.50.
+
+### Decision 6: Confidence-Based Rejection, Not Confidence-Based Filtering
 
 **Choice:** Fields below threshold are flagged in the output with `"needs_review": true` and an explanation. They are NOT silently dropped.
 
